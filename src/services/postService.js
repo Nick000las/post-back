@@ -6,7 +6,7 @@ class PostService {
     static #obterCredenciaisInstagram () {
         return {
             instagramId: process.env.INSTAGRAM_USER_ID,
-            token: process.env.META_ACCESS_TOKEN
+            token: process.env.TOKEN_IG17841413894963850
         };
     }
 
