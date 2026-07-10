@@ -48,15 +48,17 @@ class PrismaAdapter {
     }
 
     static async vincularPostConta(postId, accountId, status, apiPostId, errorMessage) {
-        return await prisma.post_accounts.create({
-            data: {
-                post_id: postId,
-                account_id: accountId,
-                delivery_status: status,
-                api_post_id: apiPostId,
-                error_message: errorMessage,
-                processed_at: new Date()
-            }
+        const dados = {
+            delivery_status: status,
+            api_post_id: apiPostId,
+            error_message: errorMessage,
+            processed_at: new Date()
+        };
+
+        return await prisma.post_accounts.upsert({
+            where: { post_id_account_id: { post_id: postId, account_id: accountId } },
+            create: { post_id: postId, account_id: accountId, ...dados },
+            update: dados
         });
     }
 
@@ -113,6 +115,101 @@ class PrismaAdapter {
 
         await prisma.accounts.delete({ where: { id: parseInt(id) } });
         return conta;
+    }
+
+    static async criarDraftComContas(caption, fileName, filePath, fileType, userId, accountIds) {
+        return await prisma.$transaction(async (tx) => {
+            const draft = await tx.posts.create({
+                data: {
+                    caption,
+                    file_path: filePath,
+                    file_name: fileName,
+                    file_type: fileType,
+                    status: 'DRAFT',
+                    user_id: userId
+                }
+            });
+
+            await tx.post_accounts.createMany({
+                data: accountIds.map(accountId => ({
+                    post_id: draft.id,
+                    account_id: accountId,
+                    delivery_status: 'PENDING'
+                }))
+            });
+
+            return draft;
+        });
+    }
+
+    static async buscarDraftPorId(draftId, userId) {
+        return await prisma.posts.findFirst({
+            where: { id: parseInt(draftId), user_id: userId, status: 'DRAFT' },
+            select: { id: true, caption: true, file_path: true, file_name: true, file_type: true, status: true, created_at: true, updated_at: true }
+        });
+    }
+
+    static async buscarDraftComContas(draftId, userId) {
+        const draft = await prisma.posts.findFirst({
+            where: { id: parseInt(draftId), user_id: userId, status: 'DRAFT' },
+            select: {
+                id: true, caption: true, file_path: true, file_name: true, file_type: true, status: true, created_at: true, updated_at: true,
+                post_accounts: { select: { accounts: { select: CONTA_SELECT_SEGURO } } }
+            }
+        });
+        if (!draft) return null;
+
+        const { post_accounts, ...draftSemVinculos } = draft;
+        return { ...draftSemVinculos, accounts: post_accounts.map(vinculo => vinculo.accounts) };
+    }
+
+    static async listarContasDoDraft(draftId, userId) {
+        const vinculos = await prisma.post_accounts.findMany({
+            where: { post_id: parseInt(draftId), accounts: { user_id: userId } },
+            select: { account_id: true }
+        });
+        return vinculos.map(vinculo => ({ id: vinculo.account_id }));
+    }
+
+    static async excluirDraft(draftId, userId) {
+        const draft = await prisma.posts.findFirst({
+            where: { id: parseInt(draftId), user_id: userId, status: 'DRAFT' },
+            select: { id: true, caption: true, file_path: true, file_name: true, file_type: true, status: true, created_at: true, updated_at: true }
+        });
+        if (!draft) return null;
+
+        await prisma.posts.delete({ where: { id: draft.id } });
+        return draft;
+    }
+
+    static async atualizarDraft(draftId, caption, userId) {
+        const resultado = await prisma.posts.updateMany({
+            where: { id: parseInt(draftId), user_id: userId, status: 'DRAFT' },
+            data: { caption, updated_at: new Date() }
+        });
+        if (resultado.count === 0) return null;
+
+        return await prisma.posts.findUnique({
+            where: { id: parseInt(draftId) },
+            select: { id: true, caption: true, file_path: true, file_name: true, file_type: true, status: true, created_at: true, updated_at: true
+            }
+        });
+    }
+
+    static async listarDrafts(userId) {
+        const drafts = await prisma.posts.findMany({
+            where: { user_id: userId, status: 'DRAFT' },
+            orderBy: { updated_at: 'desc' },
+            select: {
+                id: true, caption: true, file_path: true, file_name: true, file_type: true, status: true, created_at: true, updated_at: true,
+                post_accounts: { select: { accounts: { select: CONTA_SELECT_SEGURO } } }
+            }
+        });
+
+        return drafts.map(({ post_accounts, ...draft }) => ({
+            ...draft,
+            accounts: post_accounts.map(vinculo => vinculo.accounts)
+        }));
     }
 }
 

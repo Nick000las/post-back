@@ -2,7 +2,6 @@ const AppError = require('../errors/AppError.js');
 
 class MetaAdapter {
     static async #postToGraphApi (url, token, body, errorContext) {
-        console.log('Token:', token);
         const response = await fetch(url, {
             method: 'POST',
             headers: {
@@ -12,7 +11,18 @@ class MetaAdapter {
             body: JSON.stringify(body)
         });
         const data = await response.json();
-        if (!response.ok) throw new AppError(`${errorContext}: ${data.error.message}`);
+
+        if (!response.ok) {
+            console.error(errorContext, {
+                url,
+                body,
+                httpStatus: response.status,
+                tokenSufixo: token ? token.slice(-6) : null,
+                graphError: data.error
+            });
+            throw new AppError(`${errorContext}: ${data.error.message}`);
+        }
+
         return data;
     }
 
@@ -38,16 +48,21 @@ class MetaAdapter {
         for (let i = 0; i < tentativas; i++) {
             const response = await fetch(url);
             const data = await response.json();
-            if (!response.ok) throw new AppError(`Erro ao consultar status do container: ${data.error.message}`);
+            if (!response.ok) {
+                console.error('Erro ao consultar status do container', { creationId, httpStatus: response.status, graphError: data.error });
+                throw new AppError(`Erro ao consultar status do container: ${data.error.message}`);
+            }
 
             if (data.status_code === 'FINISHED') return;
             if (data.status_code === 'ERROR' || data.status_code === 'EXPIRED') {
+                console.error('Container falhou ao processar mídia', { creationId, statusCode: data.status_code });
                 throw new AppError(`Container falhou ao processar mídia: status ${data.status_code}`);
             }
 
             await new Promise(resolve => setTimeout(resolve, intervaloMs));
         }
 
+        console.error('Tempo esgotado aguardando o processamento da mídia', { creationId, tentativas, intervaloMs });
         throw new AppError('Tempo esgotado aguardando o processamento da mídia');
     }
 

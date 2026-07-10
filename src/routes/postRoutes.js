@@ -36,5 +36,11 @@ const uploadMidia = multer({
 });
 
 router.post('/upload/lote', authMiddleware.verificarToken, uploadMidia.single('arquivo'), postController.publicarEmLote);
+router.post('/upload/draft', authMiddleware.verificarToken, uploadMidia.single('arquivo'), postController.salvarDraft);
+router.post('/draft/:id/publish', authMiddleware.verificarToken, postController.publicarDraft);
+router.put('/draft/:id', authMiddleware.verificarToken, postController.atualizarDraft);
+router.delete('/draft/:id', authMiddleware.verificarToken, postController.excluirDraft);
+router.get('/draft/:id', authMiddleware.verificarToken, postController.buscarDraft);
+router.get('/drafts', authMiddleware.verificarToken, postController.listarDrafts);
 
 module.exports = router;
