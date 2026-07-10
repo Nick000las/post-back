@@ -1,14 +1,10 @@
 const metaAdapter = require('../adapters/metaAdapter.js');
+const prismaAdapter = require('../adapters/prismaAdapter.js');
+const cryptoUtil = require('../utils/cryptoUtil.js');
+const AppError = require('../errors/AppError.js');
 const fs = require('fs');
 
 class PostService {
-
-    static #obterCredenciaisInstagram () {
-        return {
-            instagramId: process.env.INSTAGRAM_USER_ID,
-            token: process.env.TOKEN_IG17841413894963850
-        };
-    }
 
     static #construirUrlPublica (arquivo) {
         return `${process.env.BASE_URL}/uploads/${arquivo.filename}`;
@@ -20,28 +16,70 @@ class PostService {
         }
     }
 
-    static async executarPostagemImagemInstagram (arquivo, caption) {
-        const { instagramId, token } = this.#obterCredenciaisInstagram();
-        const urlPublicaImagem = this.#construirUrlPublica(arquivo);
+    static async #publicarMidia (instagramId, token, urlPublica, caption, ehVideo) {
+        const [tentativas, intervaloMs] = ehVideo ? [30, 5000] : [10, 2000];
 
-        const creationId = await metaAdapter.criarContainerMidia(instagramId, token, urlPublicaImagem, caption);
-        await metaAdapter.aguardarContainerPronto(creationId, token);
-        const postId = await metaAdapter.publicarContainer(instagramId, token, creationId);
+        const creationId = ehVideo
+            ? await metaAdapter.criarContainerVideo(instagramId, token, urlPublica, caption)
+            : await metaAdapter.criarContainerMidia(instagramId, token, urlPublica, caption);
 
-        this.#removerArquivoLocal(arquivo);
-        return postId;
+        await metaAdapter.aguardarContainerPronto(creationId, token, tentativas, intervaloMs);
+        return metaAdapter.publicarContainer(instagramId, token, creationId);
     }
 
-    static async executarPostagemVideoInstagram (arquivo, caption) {
-        const { instagramId, token } = this.#obterCredenciaisInstagram();
-        const urlPublicaVideo = this.#construirUrlPublica(arquivo);
+    static async #registrarResultado (postId, accountId, status, apiPostId, errorMessage) {
+        try {
+            await prismaAdapter.vincularPostConta(postId, accountId, status, apiPostId, errorMessage);
+        } catch (dbError) {
+            console.error(`Falha ao registrar resultado da conta ${accountId} no post ${postId}:`, dbError.message);
+        }
+    }
 
-        const creationId = await metaAdapter.criarContainerVideo(instagramId, token, urlPublicaVideo, caption);
-        await metaAdapter.aguardarContainerPronto(creationId, token, 30, 5000);
-        const postId = await metaAdapter.publicarContainer(instagramId, token, creationId);
+    static async #processarConta (postId, account, ehVideo, urlPublica, caption, userId) {
+        let contaId = account.id;
+        try {
+            const contaReal = await prismaAdapter.buscarContaPorId(account.id, userId);
+            if (!contaReal) throw new AppError(`Conta com ID ${account.id} não encontrada`);
+            contaId = contaReal.id;
 
-        this.#removerArquivoLocal(arquivo);
-        return postId;
+            const accessToken = cryptoUtil.decrypt(contaReal.access_token);
+            const apiPostId = await this.#publicarMidia(contaReal.instagram_user_id, accessToken, urlPublica, caption, ehVideo);
+
+            await this.#registrarResultado(postId, contaId, 'SUCCESS', apiPostId, null);
+            return { accountId: contaId, status: 'success', apiPostId };
+        } catch (error) {
+            const isOperational = error instanceof AppError;
+            if (!isOperational) {
+                console.error(`Erro inesperado ao publicar na conta ${contaId}:`, error);
+            }
+            const mensagemExposta = isOperational
+                ? error.message
+                : 'Erro ao publicar nesta conta. Tente novamente mais tarde.';
+
+            await this.#registrarResultado(postId, contaId, 'FAILED', null, mensagemExposta);
+            return { accountId: contaId, status: 'failed', error: mensagemExposta };
+        }
+    }
+
+    static async gerenciarPostagemEmLote (arquivo, caption, accountsList, userId) {
+        const novoPost = await prismaAdapter.criarPost(caption, arquivo.filename, 'DRAFT', userId);
+
+        try {
+            const ehVideo = arquivo.mimetype.startsWith('video/');
+            const urlPublica = this.#construirUrlPublica(arquivo);
+
+            const relatorioEnvio = await Promise.all(
+                accountsList.map(account => this.#processarConta(novoPost.id, account, ehVideo, urlPublica, caption, userId))
+            );
+
+            const sucessos = relatorioEnvio.filter(item => item.status === 'success').length;
+            const statusFinal = sucessos === 0 ? 'FAILED' : sucessos === relatorioEnvio.length ? 'PUBLISHED' : 'PARTIAL';
+            await prismaAdapter.atualizarStatusPost(novoPost.id, statusFinal);
+
+            return relatorioEnvio;
+        } finally {
+            this.#removerArquivoLocal(arquivo);
+        }
     }
 }
 

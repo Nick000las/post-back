@@ -1,44 +1,46 @@
 const prismaAdapter = require('../adapters/prismaAdapter.js');
+const AppError = require('../errors/AppError.js');
 
 class UserService {
 
-    static async listarContas () {
-        const contas = await prismaAdapter.listarContas();
+    static async listarContas (userId) {
+        const contas = await prismaAdapter.listarContas(userId);
 
-        if(!contas || contas.length === 0) throw new Error('Nenhuma conta encontrada');
+        if(!contas || contas.length === 0) throw new AppError('Nenhuma conta encontrada');
 
         return contas;
     }
 
-    static async criarConta ({ nome, plataforma, instagramId, access_token }) {
+    static async criarConta (userId, { nome, plataforma, instagramId, access_token }) {
         if(!nome || !plataforma || !access_token) {
-            throw new Error('Campos obrigatórios: nome, plataforma e access_token');
+            throw new AppError('Campos obrigatórios: nome, plataforma e access_token');
         }
 
         if(instagramId) {
             const contaExiste = await prismaAdapter.buscarContaPorIdInstagram(instagramId);
-            if(contaExiste) throw new Error('Conta já existe');
+            if(contaExiste) throw new AppError('Conta já existe');
         }
 
         const conta = await prismaAdapter.criarConta({
             name: nome,
             platform: plataforma,
             instagram_user_id: instagramId,
-            access_token
+            access_token,
+            user_id: userId
         });
         if(!conta) throw new Error('Erro ao criar conta');
 
         return conta;
     }
 
-    static async atualizarConta (id, { nome, plataforma, instagramId, access_token }) {
-        const contaExiste = await prismaAdapter.buscarContaPorId(id);
-        if(!contaExiste) throw new Error('Conta não encontrada');
+    static async atualizarConta (id, userId, { nome, plataforma, instagramId, access_token }) {
+        const contaExiste = await prismaAdapter.buscarContaPorId(id, userId);
+        if(!contaExiste) throw new AppError('Conta não encontrada');
 
         if(instagramId) {
             const outraConta = await prismaAdapter.buscarContaPorIdInstagram(instagramId);
             if(outraConta && outraConta.id !== parseInt(id)) {
-                throw new Error('Outra conta com o mesmo Instagram ID já existe');
+                throw new AppError('Outra conta com o mesmo Instagram ID já existe');
             }
         }
 
@@ -48,17 +50,14 @@ class UserService {
         if(instagramId !== undefined) atualizacoes.instagram_user_id = instagramId;
         if(access_token !== undefined) atualizacoes.access_token = access_token;
 
-        const conta = await prismaAdapter.atualizarConta(id, atualizacoes);
+        const conta = await prismaAdapter.atualizarConta(id, userId, atualizacoes);
 
         return conta ?? [];
     }
 
-    static async excluirConta (id) {
-        const contaExiste = await prismaAdapter.buscarContaPorId(id);
-        if(!contaExiste) throw new Error('Conta não encontrada');
-
-        const conta = await prismaAdapter.excluirConta(id);
-        if(!conta) throw new Error('Erro ao excluir conta');
+    static async excluirConta (id, userId) {
+        const conta = await prismaAdapter.excluirConta(id, userId);
+        if(!conta) throw new AppError('Conta não encontrada');
 
         return conta;
     }

@@ -4,6 +4,7 @@ const router = express.Router();
 const path = require('path');
 const fs = require('fs');
 const postController = require('../controllers/postController.js');
+const authMiddleware = require('../middlewares/authMiddleware.js');
 
 const storage = multer.diskStorage({
     destination: (req, file, cb) => {
@@ -18,6 +19,7 @@ const storage = multer.diskStorage({
 
 const ALLOWED_IMAGE_MIME_TYPES = ['image/jpeg', 'image/png'];
 const ALLOWED_VIDEO_MIME_TYPES = ['video/mp4', 'video/quicktime'];
+const ALLOWED_MIDIA_MIME_TYPES = [...ALLOWED_IMAGE_MIME_TYPES, ...ALLOWED_VIDEO_MIME_TYPES];
 
 const criarFiltroDeArquivo = (tiposPermitidos, mensagemErro) => (req, file, cb) => {
     if (tiposPermitidos.includes(file.mimetype)) {
@@ -27,18 +29,12 @@ const criarFiltroDeArquivo = (tiposPermitidos, mensagemErro) => (req, file, cb) 
     }
 };
 
-const uploadImagem = multer({
+const uploadMidia = multer({
     storage,
-    fileFilter: criarFiltroDeArquivo(ALLOWED_IMAGE_MIME_TYPES, 'Formato de imagem não suportado. Use JPEG ou PNG')
-});
-
-const uploadVideo = multer({
-    storage,
-    fileFilter: criarFiltroDeArquivo(ALLOWED_VIDEO_MIME_TYPES, 'Formato de vídeo não suportado. Use MP4 ou MOV'),
+    fileFilter: criarFiltroDeArquivo(ALLOWED_MIDIA_MIME_TYPES, 'Formato não suportado. Use JPEG, PNG, MP4 ou MOV'),
     limits: { fileSize: 300 * 1024 * 1024 }
 });
 
-router.post('/upload/img', uploadImagem.single('image'), postController.publicarImagemInstagram);
-router.post('/upload/vid', uploadVideo.single('video'), postController.publicarVideoInstagram);
+router.post('/upload/lote', authMiddleware.verificarToken, uploadMidia.single('arquivo'), postController.publicarEmLote);
 
 module.exports = router;

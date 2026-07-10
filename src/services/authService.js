@@ -1,12 +1,13 @@
 const prismaAdapter = require('../adapters/prismaAdapter.js');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const AppError = require('../errors/AppError.js');
 
 class AuthService {
 
     static async registrar(name, email, password) {
         const usuarioExiste = await prismaAdapter.buscarUsuarioPorEmail(email);
-        if (usuarioExiste) throw new Error('Usuário já existe');
+        if (usuarioExiste) throw new AppError('Usuário já existe');
         
         const hashedPassword = await bcrypt.hash(password, 10);
 
@@ -21,10 +22,10 @@ class AuthService {
 
     static async login(email, password) {
         const usuario = await prismaAdapter.buscarUsuarioPorEmail(email);
-        if (!usuario) throw new Error('Usuário não encontrado');
+        if (!usuario) throw new AppError('Usuário não encontrado');
 
         const senhaValida = await bcrypt.compare(password, usuario.password_hash);
-        if (!senhaValida) throw new Error('Senha inválida');
+        if (!senhaValida) throw new AppError('Senha inválida');
 
         const token = jwt.sign({ id: usuario.id, email: usuario.email }, process.env.JWT_SECRET, { expiresIn: '1h' });
 
@@ -40,7 +41,7 @@ class AuthService {
 
     static async me(id) {
         const usuario = await prismaAdapter.buscarUsuarioPorId(id);
-        if (!usuario) throw new Error('Usuário não encontrado');
+        if (!usuario) throw new AppError('Usuário não encontrado');
 
         return {
             id: usuario.id,

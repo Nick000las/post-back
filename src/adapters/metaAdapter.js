@@ -1,6 +1,8 @@
+const AppError = require('../errors/AppError.js');
 
 class MetaAdapter {
     static async #postToGraphApi (url, token, body, errorContext) {
+        console.log('Token:', token);
         const response = await fetch(url, {
             method: 'POST',
             headers: {
@@ -10,7 +12,7 @@ class MetaAdapter {
             body: JSON.stringify(body)
         });
         const data = await response.json();
-        if (!response.ok) throw new Error(`${errorContext}: ${data.error.message}`);
+        if (!response.ok) throw new AppError(`${errorContext}: ${data.error.message}`);
         return data;
     }
 
@@ -36,17 +38,17 @@ class MetaAdapter {
         for (let i = 0; i < tentativas; i++) {
             const response = await fetch(url);
             const data = await response.json();
-            if (!response.ok) throw new Error(`Erro ao consultar status do container: ${data.error.message}`);
+            if (!response.ok) throw new AppError(`Erro ao consultar status do container: ${data.error.message}`);
 
             if (data.status_code === 'FINISHED') return;
             if (data.status_code === 'ERROR' || data.status_code === 'EXPIRED') {
-                throw new Error(`Container falhou ao processar mídia: status ${data.status_code}`);
+                throw new AppError(`Container falhou ao processar mídia: status ${data.status_code}`);
             }
 
             await new Promise(resolve => setTimeout(resolve, intervaloMs));
         }
 
-        throw new Error('Tempo esgotado aguardando o processamento da mídia');
+        throw new AppError('Tempo esgotado aguardando o processamento da mídia');
     }
 
     static async publicarContainer (instagramId, token, creationId) {
