@@ -3,6 +3,7 @@ const cors = require('cors');
 require('dotenv').config();
 const morgan = require('morgan');
 const cookieParser = require('cookie-parser');
+const path = require('path');
 const postRoutes = require('./routes/postRoutes.js');
 const userRoutes = require('./routes/userRoutes.js');
 const authRoutes = require('./routes/authRoutes.js');
@@ -17,7 +18,7 @@ app.use(cookieParser());
 
 const PORT = process.env.PORT || 3001;
 
-app.use('/uploads', express.static('.uploads'));
+app.use('/uploads', express.static(path.join(__dirname, '..', '.uploads')));
 app.use(morgan('dev'));
 
 app.use('/', postRoutes);

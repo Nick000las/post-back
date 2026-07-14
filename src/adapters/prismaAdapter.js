@@ -29,11 +29,13 @@ class PrismaAdapter {
         });
     }
 
-    static async criarPost(caption, filePath, status, userId) {
+    static async criarPost(caption, filePath, fileName, fileType, status, userId) {
         return await prisma.posts.create({
             data: {
                 caption,
                 file_path: filePath,
+                file_name: fileName,
+                file_type: fileType,
                 status,
                 user_id: userId
             }
@@ -210,6 +212,45 @@ class PrismaAdapter {
             ...draft,
             accounts: post_accounts.map(vinculo => vinculo.accounts)
         }));
+    }
+
+    static async listarFeed(page, limit) {
+        const where = { status: { in: ['PUBLISHED', 'PARTIAL'] } };
+        const skip = (page - 1) * limit;
+
+        const [posts, total] = await Promise.all([
+            prisma.posts.findMany({
+                where,
+                orderBy: { updated_at: 'desc' },
+                skip,
+                take: limit,
+                select: {
+                    id: true, caption: true, file_path: true, file_name: true, file_type: true, status: true, created_at: true, updated_at: true,
+                    users: { select: { id: true, name: true } },
+                    post_accounts: {
+                        select: {
+                            delivery_status: true,
+                            error_message: true,
+                            accounts: { select: CONTA_SELECT_SEGURO }
+                        }
+                    }
+                }
+            }),
+            prisma.posts.count({ where })
+        ]);
+
+        return {
+            posts: posts.map(({ post_accounts, users, ...post }) => ({
+                ...post,
+                author: users,
+                accounts: post_accounts.map(vinculo => ({
+                    ...vinculo.accounts,
+                    delivery_status: vinculo.delivery_status,
+                    error_message: vinculo.error_message
+                }))
+            })),
+            total
+        };
     }
 }
 

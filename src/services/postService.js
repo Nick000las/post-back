@@ -84,13 +84,9 @@ class PostService {
     }
 
     static async gerenciarPostagemEmLote (arquivo, caption, accountsList, userId) {
-        const novoPost = await prismaAdapter.criarPost(caption, arquivo.filename, 'DRAFT', userId);
+        const novoPost = await prismaAdapter.criarPost(caption, arquivo.filename, arquivo.originalname, arquivo.mimetype, 'DRAFT', userId);
 
-        try {
-            return await this.#executarEnvioParaContas({ id: novoPost.id, caption }, arquivo, accountsList, userId);
-        } finally {
-            this.#removerArquivoLocal(arquivo);
-        }
+        return this.#executarEnvioParaContas({ id: novoPost.id, caption }, arquivo, accountsList, userId);
     }
 
     static async criarDraft (caption, arquivo, accountIds, userId) {
@@ -135,6 +131,20 @@ class PostService {
 
         this.#removerArquivoLocal({ path: path.join(UPLOADS_DIR, draft.file_path) });
         return draft;
+    }
+
+    static async listarFeed (page, limit) {
+        const { posts, total } = await prismaAdapter.listarFeed(page, limit);
+
+        return {
+            feed: posts,
+            pagination: {
+                page,
+                limit,
+                total,
+                totalPages: Math.ceil(total / limit)
+            }
+        };
     }
 }
 

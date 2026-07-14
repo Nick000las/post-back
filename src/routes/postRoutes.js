@@ -43,4 +43,6 @@ router.delete('/draft/:id', authMiddleware.verificarToken, postController.exclui
 router.get('/draft/:id', authMiddleware.verificarToken, postController.buscarDraft);
 router.get('/drafts', authMiddleware.verificarToken, postController.listarDrafts);
 
+router.get('/feed', authMiddleware.verificarToken, postController.listarFeed);
+
 module.exports = router;

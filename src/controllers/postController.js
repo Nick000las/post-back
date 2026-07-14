@@ -19,6 +19,20 @@ class PostController {
         return accounts;
     }
 
+    static #parsePaginacao (query) {
+        const PAGE_PADRAO = 1;
+        const LIMITE_PADRAO = 10;
+        const LIMITE_MAXIMO = 50;
+
+        const page = Number.parseInt(query.page, 10);
+        const limit = Number.parseInt(query.limit, 10);
+
+        return {
+            page: Number.isInteger(page) && page > 0 ? page : PAGE_PADRAO,
+            limit: Number.isInteger(limit) && limit > 0 ? Math.min(limit, LIMITE_MAXIMO) : LIMITE_PADRAO
+        };
+    }
+
     static async publicarEmLote (req, res) {
         const arquivo = req.file;
 
@@ -132,6 +146,19 @@ class PostController {
         }
     }
 
+    static async listarFeed (req, res) {
+        try {
+            const { page, limit } = PostController.#parsePaginacao(req.query);
+            const { feed, pagination } = await postService.listarFeed(page, limit);
+
+            return res.status(200).json({ feed, pagination });
+        } catch (error) {
+            return responderComErro(res, error, {
+                logContext: 'Erro ao listar feed:',
+                mensagemPadrao: 'Não foi possível carregar as postagens da equipe'
+            });
+        }
+    }
 }
 
 module.exports = PostController;
