@@ -9,25 +9,10 @@ const UPLOADS_DIR = '.uploads';
 
 class PostService {
 
-    static #construirUrlPublica (arquivo) {
-        return `${process.env.BASE_URL}/uploads/${arquivo.filename}`;
-    }
-
     static #removerArquivoLocal (arquivo) {
         if (fs.existsSync(arquivo.path)) {
             fs.unlinkSync(arquivo.path);
         }
-    }
-
-    static async #publicarMidia (instagramId, token, urlPublica, caption, ehVideo) {
-        const [tentativas, intervaloMs] = ehVideo ? [30, 5000] : [10, 2000];
-
-        const creationId = ehVideo
-            ? await metaAdapter.criarContainerVideo(instagramId, token, urlPublica, caption)
-            : await metaAdapter.criarContainerMidia(instagramId, token, urlPublica, caption);
-
-        await metaAdapter.aguardarContainerPronto(creationId, token, tentativas, intervaloMs);
-        return metaAdapter.publicarContainer(instagramId, token, creationId);
     }
 
     static async #registrarResultado (postId, accountId, status, apiPostId, errorMessage) {
@@ -38,7 +23,7 @@ class PostService {
         }
     }
 
-    static async #processarConta (postId, account, ehVideo, urlPublica, caption, userId) {
+    static async #processarConta (account, post, userId) {
         let contaId = account.id;
         try {
             const contaReal = await prismaAdapter.buscarContaPorId(account.id, userId);
@@ -46,34 +31,31 @@ class PostService {
             contaId = contaReal.id;
 
             const accessToken = cryptoUtil.decrypt(contaReal.access_token);
-            const apiPostId = await this.#publicarMidia(contaReal.instagram_user_id, accessToken, urlPublica, caption, ehVideo);
+            const { externalId } = await metaAdapter.publicarNoInstagram(post, accessToken, contaReal.instagram_user_id);
 
-            await this.#registrarResultado(postId, contaId, 'SUCCESS', apiPostId, null);
-            return { accountId: contaId, status: 'success', apiPostId };
+            await this.#registrarResultado(post.id, contaId, 'SUCCESS', externalId, null);
+            return { accountId: contaId, status: 'success', apiPostId: externalId };
         } catch (error) {
             const isOperational = error instanceof AppError;
             const mensagemExposta = isOperational
                 ? error.message
                 : 'Erro ao publicar nesta conta. Tente novamente mais tarde.';
 
-            const contexto = { postId, contaId, userId, urlPublica, ehVideo, erro: error.message };
+            const contexto = { postId: post.id, contaId, userId, erro: error.message };
             if (isOperational) {
-                console.warn(`Falha ao publicar post ${postId} na conta ${contaId}`, contexto);
+                console.warn(`Falha ao publicar post ${post.id} na conta ${contaId}`, contexto);
             } else {
-                console.error(`Erro inesperado ao publicar post ${postId} na conta ${contaId}`, { ...contexto, stack: error.stack });
+                console.error(`Erro inesperado ao publicar post ${post.id} na conta ${contaId}`, { ...contexto, stack: error.stack });
             }
 
-            await this.#registrarResultado(postId, contaId, 'FAILED', null, mensagemExposta);
+            await this.#registrarResultado(post.id, contaId, 'FAILED', null, mensagemExposta);
             return { accountId: contaId, status: 'failed', error: mensagemExposta };
         }
     }
 
-    static async #executarEnvioParaContas (post, arquivo, accountsList, userId) {
-        const ehVideo = arquivo.mimetype.startsWith('video/');
-        const urlPublica = this.#construirUrlPublica(arquivo);
-
+    static async #executarEnvioParaContas (post, accountsList, userId) {
         const relatorioEnvio = await Promise.all(
-            accountsList.map(account => this.#processarConta(post.id, account, ehVideo, urlPublica, post.caption, userId))
+            accountsList.map(account => this.#processarConta(account, post, userId))
         );
 
         const sucessos = relatorioEnvio.filter(item => item.status === 'success').length;
@@ -86,7 +68,14 @@ class PostService {
     static async gerenciarPostagemEmLote (arquivo, caption, accountsList, userId) {
         const novoPost = await prismaAdapter.criarPost(caption, arquivo.filename, arquivo.originalname, arquivo.mimetype, 'DRAFT', userId);
 
-        return this.#executarEnvioParaContas({ id: novoPost.id, caption }, arquivo, accountsList, userId);
+        const post = {
+            id: novoPost.id,
+            caption,
+            file_path: arquivo.filename,
+            file_name: arquivo.originalname,
+            file_type: arquivo.mimetype
+        };
+        return this.#executarEnvioParaContas(post, accountsList, userId);
     }
 
     static async criarDraft (caption, arquivo, accountIds, userId) {
@@ -104,8 +93,7 @@ class PostService {
         const contasVinculadas = await prismaAdapter.listarContasDoDraft(draftId, userId);
         if (contasVinculadas.length === 0) throw new AppError('Este rascunho não possui contas vinculadas');
 
-        const arquivo = { filename: draft.file_path, mimetype: draft.file_type };
-        return this.#executarEnvioParaContas(draft, arquivo, contasVinculadas, userId);
+        return this.#executarEnvioParaContas(draft, contasVinculadas, userId);
     }
 
     static async atualizarDraft (draftId, caption, userId) {
