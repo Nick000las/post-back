@@ -45,7 +45,7 @@ class PostController {
 
             try {
                 const resultado = await postService.gerenciarPostagemEmLote(arquivo, caption, accounts, req.user.id);
-                return res.status(200).json({ message: 'Postagem em lote concluída', detalhes: resultado });
+                return res.status(202).json({ message: 'Postagem em lote recebida e em processamento', detalhes: resultado });
             } catch (erroInterno) {
                 return responderComErro(res, erroInterno, {
                     logContext: 'Erro inesperado ao processar postagem em lote:',
@@ -85,7 +85,7 @@ class PostController {
         const { id } = req.params;
         try {
             const resultado = await postService.publicarDraft(id, req.user.id);
-            return res.status(200).json({ message: 'Draft publicado com sucesso', detalhes: resultado });
+            return res.status(202).json({ message: 'Draft recebido e em processamento', detalhes: resultado });
         } catch (error) {
             return responderComErro(res, error, {
                 logContext: 'Erro ao publicar draft:',

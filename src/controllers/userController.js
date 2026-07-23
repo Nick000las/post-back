@@ -18,8 +18,8 @@ class UserController {
 
     static async criarConta (req, res) {
         try {
-            const { nome, plataforma, instagramId, access_token } = req.body;
-            const conta = await userService.criarConta(req.user.id, { nome, plataforma, instagramId, access_token });
+            const { nome, plataforma, platformAccountId, access_token } = req.body;
+            const conta = await userService.criarConta(req.user.id, { nome, plataforma, platformAccountId, access_token });
             res.status(201).json({ message: 'Conta criada com sucesso', conta });
         } catch (error) {
             responderComErro(res, error, {
@@ -32,8 +32,8 @@ class UserController {
     static async atualizarConta (req, res) {
         try {
             const { id } = req.params;
-            const { nome, plataforma, instagramId, access_token } = req.body;
-            const conta = await userService.atualizarConta(id, req.user.id, { nome, plataforma, instagramId, access_token });
+            const { nome, plataforma, platformAccountId, access_token } = req.body;
+            const conta = await userService.atualizarConta(id, req.user.id, { nome, plataforma, platformAccountId, access_token });
             res.status(200).json({ message: 'Conta atualizada com sucesso', conta });
         } catch (error) {
             responderComErro(res, error, {

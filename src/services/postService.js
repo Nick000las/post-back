@@ -1,7 +1,6 @@
-const metaAdapter = require('../adapters/metaAdapter.js');
 const prismaAdapter = require('../adapters/prismaAdapter.js');
-const cryptoUtil = require('../utils/cryptoUtil.js');
 const AppError = require('../errors/AppError.js');
+const { publishQueue } = require('../queues/publishQueue.js');
 const fs = require('fs');
 const path = require('path');
 
@@ -15,54 +14,30 @@ class PostService {
         }
     }
 
-    static async #registrarResultado (postId, accountId, status, apiPostId, errorMessage) {
-        try {
-            await prismaAdapter.vincularPostConta(postId, accountId, status, apiPostId, errorMessage);
-        } catch (dbError) {
-            console.error('Falha ao registrar resultado da conta no post', { postId, accountId, erro: dbError.message });
-        }
-    }
+    // A tentativa de publicar em si (e o registro de sucesso/falha por conta) migrou pro worker
+    // (src/workers/publishWorker.js) — aqui só marcamos o post como "em processamento" e enfileiramos.
+    static async #enfileirarContas (post, accountsList, userId) {
+        await prismaAdapter.atualizarStatusPost(post.id, 'PROCESSING');
 
-    static async #processarConta (account, post, userId) {
-        let contaId = account.id;
-        try {
-            const contaReal = await prismaAdapter.buscarContaPorId(account.id, userId);
-            if (!contaReal) throw new AppError(`Conta com ID ${account.id} não encontrada`);
-            contaId = contaReal.id;
-
-            const accessToken = cryptoUtil.decrypt(contaReal.access_token);
-            const { externalId } = await metaAdapter.publicarNoInstagram(post, accessToken, contaReal.instagram_user_id);
-
-            await this.#registrarResultado(post.id, contaId, 'SUCCESS', externalId, null);
-            return { accountId: contaId, status: 'success', apiPostId: externalId };
-        } catch (error) {
-            const isOperational = error instanceof AppError;
-            const mensagemExposta = isOperational
-                ? error.message
-                : 'Erro ao publicar nesta conta. Tente novamente mais tarde.';
-
-            const contexto = { postId: post.id, contaId, userId, erro: error.message };
-            if (isOperational) {
-                console.warn(`Falha ao publicar post ${post.id} na conta ${contaId}`, contexto);
-            } else {
-                console.error(`Erro inesperado ao publicar post ${post.id} na conta ${contaId}`, { ...contexto, stack: error.stack });
-            }
-
-            await this.#registrarResultado(post.id, contaId, 'FAILED', null, mensagemExposta);
-            return { accountId: contaId, status: 'failed', error: mensagemExposta };
-        }
-    }
-
-    static async #executarEnvioParaContas (post, accountsList, userId) {
-        const relatorioEnvio = await Promise.all(
-            accountsList.map(account => this.#processarConta(account, post, userId))
+        await Promise.all(
+            accountsList.map(account => publishQueue.add('publicar-conta', { postId: post.id, accountId: account.id, userId }))
         );
 
-        const sucessos = relatorioEnvio.filter(item => item.status === 'success').length;
-        const statusFinal = sucessos === 0 ? 'FAILED' : sucessos === relatorioEnvio.length ? 'PUBLISHED' : 'PARTIAL';
-        await prismaAdapter.atualizarStatusPost(post.id, statusFinal);
+        return { status: 'queued', postId: post.id, totalContas: accountsList.length };
+    }
 
-        return relatorioEnvio;
+    // Chamado pelo worker depois de cada job (sucesso ou falha definitiva) pra fechar o status do post
+    // quando todas as contas já tiverem sido processadas.
+    static async finalizarStatusSeCompleto (postId) {
+        const contas = await prismaAdapter.listarStatusContasDoPost(postId);
+
+        const aindaProcessando = contas.some(conta => conta.delivery_status === 'PENDING');
+        if (aindaProcessando) return;
+
+        const sucessos = contas.filter(conta => conta.delivery_status === 'SUCCESS').length;
+        const statusFinal = sucessos === 0 ? 'FAILED' : sucessos === contas.length ? 'PUBLISHED' : 'PARTIAL';
+
+        await prismaAdapter.atualizarStatusPost(postId, statusFinal);
     }
 
     static async gerenciarPostagemEmLote (arquivo, caption, accountsList, userId) {
@@ -75,7 +50,7 @@ class PostService {
             file_name: arquivo.originalname,
             file_type: arquivo.mimetype
         };
-        return this.#executarEnvioParaContas(post, accountsList, userId);
+        return this.#enfileirarContas(post, accountsList, userId);
     }
 
     static async criarDraft (caption, arquivo, accountIds, userId) {
@@ -93,7 +68,7 @@ class PostService {
         const contasVinculadas = await prismaAdapter.listarContasDoDraft(draftId, userId);
         if (contasVinculadas.length === 0) throw new AppError('Este rascunho não possui contas vinculadas');
 
-        return this.#executarEnvioParaContas(draft, contasVinculadas, userId);
+        return this.#enfileirarContas(draft, contasVinculadas, userId);
     }
 
     static async atualizarDraft (draftId, caption, userId) {

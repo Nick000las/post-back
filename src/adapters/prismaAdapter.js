@@ -6,7 +6,7 @@ const CONTA_SELECT_SEGURO = {
     id: true,
     name: true,
     platform: true,
-    instagram_user_id: true,
+    platform_account_id: true,
     created_at: true
 };
 
@@ -77,9 +77,9 @@ class PrismaAdapter {
         });
     }
 
-    static async buscarContaPorIdInstagram(instagramUserId) {
+    static async buscarContaPorPlatformAccountId(platformAccountId) {
         return await prisma.accounts.findUnique({
-            where: { instagram_user_id: instagramUserId }
+            where: { platform_account_id: platformAccountId }
         });
     }
 
@@ -151,6 +151,19 @@ class PrismaAdapter {
         });
     }
 
+    static async buscarPostPorId(postId) {
+        return await prisma.posts.findUnique({
+            where: { id: postId }
+        });
+    }
+
+    static async listarStatusContasDoPost(postId) {
+        return await prisma.post_accounts.findMany({
+            where: { post_id: postId },
+            select: { delivery_status: true }
+        });
+    }
+
     static async buscarDraftComContas(draftId, userId) {
         const draft = await prisma.posts.findFirst({
             where: { id: parseInt(draftId), user_id: userId, status: 'DRAFT' },
@@ -215,7 +228,7 @@ class PrismaAdapter {
     }
 
     static async listarFeed(page, limit) {
-        const where = { status: { in: ['PUBLISHED', 'PARTIAL'] } };
+        const where = { status: { in: ['PUBLISHED', 'PARTIAL', 'PROCESSING', 'FAILED'] } };
         const skip = (page - 1) * limit;
 
         const [posts, total] = await Promise.all([
