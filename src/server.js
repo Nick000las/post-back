@@ -7,6 +7,7 @@ const path = require('path');
 const postRoutes = require('./routes/postRoutes.js');
 const userRoutes = require('./routes/userRoutes.js');
 const authRoutes = require('./routes/authRoutes.js');
+const clientRoutes = require('./routes/clientRoutes.js');
 
 const app = express();
 app.use(cors({
@@ -24,6 +25,7 @@ app.use(morgan('dev'));
 app.use('/', postRoutes);
 app.use('/', userRoutes);
 app.use('/', authRoutes);
+app.use('/', clientRoutes);
 
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);

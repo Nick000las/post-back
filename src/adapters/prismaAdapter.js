@@ -10,7 +10,50 @@ const CONTA_SELECT_SEGURO = {
     created_at: true
 };
 
+// accounts e posts pertencem a um client (não mais direto a um user) — todo método que antes
+// filtrava por user_id agora filtra por client_id. postService/userService validam a posse do
+// client (buscarClientePorId) antes de repassar clientId pra cá.
+
 class PrismaAdapter {
+    static async buscarClientePorId(clientId, userId) {
+        return await prisma.clients.findFirst({
+            where: { id: parseInt(clientId), user_id: userId }
+        });
+    }
+
+    static async criarClient(name, userId) {
+        return await prisma.clients.create({
+            data: { name, user_id: userId }
+        });
+    }
+
+    static async listarClients(userId) {
+        return await prisma.clients.findMany({
+            where: { user_id: userId },
+            orderBy: { created_at: 'desc' }
+        });
+    }
+
+    static async atualizarClient(id, userId, name) {
+        const resultado = await prisma.clients.updateMany({
+            where: { id: parseInt(id), user_id: userId },
+            data: { name }
+        });
+        if (resultado.count === 0) return null;
+
+        return await prisma.clients.findUnique({ where: { id: parseInt(id) } });
+    }
+
+    static async excluirClient(id, userId) {
+        const client = await prisma.clients.findFirst({
+            where: { id: parseInt(id), user_id: userId }
+        });
+        if (!client) return null;
+
+        await prisma.clients.delete({ where: { id: client.id } });
+        return client;
+    }
+
     static async buscarUsuarioPorEmail(email) {
         return await prisma.users.findUnique({
             where: { email }
@@ -29,7 +72,7 @@ class PrismaAdapter {
         });
     }
 
-    static async criarPost(caption, filePath, fileName, fileType, status, userId) {
+    static async criarPost(caption, filePath, fileName, fileType, status, clientId, scheduledFor = null) {
         return await prisma.posts.create({
             data: {
                 caption,
@@ -37,8 +80,17 @@ class PrismaAdapter {
                 file_name: fileName,
                 file_type: fileType,
                 status,
-                user_id: userId
+                client_id: parseInt(clientId),
+                scheduled_for: scheduledFor
             }
+        });
+    }
+
+    static async registrarJobAgendado(postId, accountId, jobId) {
+        return await prisma.post_accounts.upsert({
+            where: { post_id_account_id: { post_id: postId, account_id: accountId } },
+            create: { post_id: postId, account_id: accountId, delivery_status: 'PENDING', job_id: jobId },
+            update: { job_id: jobId }
         });
     }
 
@@ -64,16 +116,16 @@ class PrismaAdapter {
         });
     }
 
-    static async listarContas(userId) {
+    static async listarContas(clientId) {
         return await prisma.accounts.findMany({
-            where: { user_id: userId },
+            where: { client_id: parseInt(clientId) },
             select: CONTA_SELECT_SEGURO
         });
     }
 
-    static async buscarContaPorId(id, userId) {
+    static async buscarContaPorId(id, clientId) {
         return await prisma.accounts.findFirst({
-            where: { id: parseInt(id), user_id: userId }
+            where: { id: parseInt(id), client_id: parseInt(clientId) }
         });
     }
 
@@ -83,6 +135,7 @@ class PrismaAdapter {
         });
     }
 
+    // contaData precisa trazer client_id (não mais user_id) — quem monta esse objeto é o caller.
     static async criarConta(contaData) {
         const dadosCriptografados = { ...contaData, access_token: cryptoUtil.encrypt(contaData.access_token) };
         return await prisma.accounts.create({
@@ -91,13 +144,13 @@ class PrismaAdapter {
         });
     }
 
-    static async atualizarConta(id, userId, atualizacoes) {
+    static async atualizarConta(id, clientId, atualizacoes) {
         const dados = atualizacoes.access_token
             ? { ...atualizacoes, access_token: cryptoUtil.encrypt(atualizacoes.access_token) }
             : atualizacoes;
 
         const resultado = await prisma.accounts.updateMany({
-            where: { id: parseInt(id), user_id: userId },
+            where: { id: parseInt(id), client_id: parseInt(clientId) },
             data: dados
         });
         if (resultado.count === 0) return null;
@@ -108,9 +161,9 @@ class PrismaAdapter {
         });
     }
 
-    static async excluirConta(id, userId) {
+    static async excluirConta(id, clientId) {
         const conta = await prisma.accounts.findFirst({
-            where: { id: parseInt(id), user_id: userId },
+            where: { id: parseInt(id), client_id: parseInt(clientId) },
             select: CONTA_SELECT_SEGURO
         });
         if (!conta) return null;
@@ -119,7 +172,7 @@ class PrismaAdapter {
         return conta;
     }
 
-    static async criarDraftComContas(caption, fileName, filePath, fileType, userId, accountIds) {
+    static async criarDraftComContas(caption, fileName, filePath, fileType, clientId, accountIds) {
         return await prisma.$transaction(async (tx) => {
             const draft = await tx.posts.create({
                 data: {
@@ -128,7 +181,7 @@ class PrismaAdapter {
                     file_name: fileName,
                     file_type: fileType,
                     status: 'DRAFT',
-                    user_id: userId
+                    client_id: parseInt(clientId)
                 }
             });
 
@@ -144,9 +197,9 @@ class PrismaAdapter {
         });
     }
 
-    static async buscarDraftPorId(draftId, userId) {
+    static async buscarDraftPorId(draftId, clientId) {
         return await prisma.posts.findFirst({
-            where: { id: parseInt(draftId), user_id: userId, status: 'DRAFT' },
+            where: { id: parseInt(draftId), client_id: parseInt(clientId), status: 'DRAFT' },
             select: { id: true, caption: true, file_path: true, file_name: true, file_type: true, status: true, created_at: true, updated_at: true }
         });
     }
@@ -157,6 +210,59 @@ class PrismaAdapter {
         });
     }
 
+    // Usado pelo endpoint GET /posts/:id/status — busca o post filtrando por client_id (pra não
+    // vazar status de post de outro cliente) + post_accounts com delivery_status/error_message.
+    static async buscarPostComStatusContas(postId, clientId) {
+        const post = await prisma.posts.findFirst({
+            where: { id: parseInt(postId), client_id: parseInt(clientId) },
+            select: {
+                id: true,
+                status: true,
+                post_accounts: {
+                    select: {
+                        delivery_status: true,
+                        error_message: true,
+                        accounts: { select: { id: true, platform: true } }
+                    }
+                }
+            }
+        });
+        if (!post) return null;
+
+        const { post_accounts, ...rest } = post;
+        return {
+            ...rest,
+            accounts: post_accounts.map(vinculo => ({
+                accountId: vinculo.accounts.id,
+                platform: vinculo.accounts.platform,
+                delivery_status: vinculo.delivery_status,
+                error_message: vinculo.error_message
+            }))
+        };
+    }
+
+    static async buscarPostAgendadoComJobs(postId, clientId) {
+        return await prisma.posts.findFirst({
+            where: { id: parseInt(postId), client_id: parseInt(clientId), status: 'SCHEDULED' },
+            select: {
+                id: true,
+                file_path: true,
+                post_accounts: { select: { job_id: true } }
+            }
+        });
+    }
+
+    static async excluirPostAgendado(postId, clientId) {
+        const post = await prisma.posts.findFirst({
+            where: { id: parseInt(postId), client_id: parseInt(clientId), status: 'SCHEDULED' },
+            select: { id: true, file_path: true }
+        });
+        if (!post) return null;
+
+        await prisma.posts.delete({ where: { id: post.id } });
+        return post;
+    }
+
     static async listarStatusContasDoPost(postId) {
         return await prisma.post_accounts.findMany({
             where: { post_id: postId },
@@ -164,9 +270,9 @@ class PrismaAdapter {
         });
     }
 
-    static async buscarDraftComContas(draftId, userId) {
+    static async buscarDraftComContas(draftId, clientId) {
         const draft = await prisma.posts.findFirst({
-            where: { id: parseInt(draftId), user_id: userId, status: 'DRAFT' },
+            where: { id: parseInt(draftId), client_id: parseInt(clientId), status: 'DRAFT' },
             select: {
                 id: true, caption: true, file_path: true, file_name: true, file_type: true, status: true, created_at: true, updated_at: true,
                 post_accounts: { select: { accounts: { select: CONTA_SELECT_SEGURO } } }
@@ -178,17 +284,17 @@ class PrismaAdapter {
         return { ...draftSemVinculos, accounts: post_accounts.map(vinculo => vinculo.accounts) };
     }
 
-    static async listarContasDoDraft(draftId, userId) {
+    static async listarContasDoDraft(draftId, clientId) {
         const vinculos = await prisma.post_accounts.findMany({
-            where: { post_id: parseInt(draftId), accounts: { user_id: userId } },
+            where: { post_id: parseInt(draftId), accounts: { client_id: parseInt(clientId) } },
             select: { account_id: true }
         });
         return vinculos.map(vinculo => ({ id: vinculo.account_id }));
     }
 
-    static async excluirDraft(draftId, userId) {
+    static async excluirDraft(draftId, clientId) {
         const draft = await prisma.posts.findFirst({
-            where: { id: parseInt(draftId), user_id: userId, status: 'DRAFT' },
+            where: { id: parseInt(draftId), client_id: parseInt(clientId), status: 'DRAFT' },
             select: { id: true, caption: true, file_path: true, file_name: true, file_type: true, status: true, created_at: true, updated_at: true }
         });
         if (!draft) return null;
@@ -197,9 +303,9 @@ class PrismaAdapter {
         return draft;
     }
 
-    static async atualizarDraft(draftId, caption, userId) {
+    static async atualizarDraft(draftId, caption, clientId) {
         const resultado = await prisma.posts.updateMany({
-            where: { id: parseInt(draftId), user_id: userId, status: 'DRAFT' },
+            where: { id: parseInt(draftId), client_id: parseInt(clientId), status: 'DRAFT' },
             data: { caption, updated_at: new Date() }
         });
         if (resultado.count === 0) return null;
@@ -211,9 +317,9 @@ class PrismaAdapter {
         });
     }
 
-    static async listarDrafts(userId) {
+    static async listarDrafts(clientId) {
         const drafts = await prisma.posts.findMany({
-            where: { user_id: userId, status: 'DRAFT' },
+            where: { client_id: parseInt(clientId), status: 'DRAFT' },
             orderBy: { updated_at: 'desc' },
             select: {
                 id: true, caption: true, file_path: true, file_name: true, file_type: true, status: true, created_at: true, updated_at: true,
@@ -228,7 +334,7 @@ class PrismaAdapter {
     }
 
     static async listarFeed(page, limit) {
-        const where = { status: { in: ['PUBLISHED', 'PARTIAL', 'PROCESSING', 'FAILED'] } };
+        const where = { status: { in: ['SCHEDULED', 'PUBLISHED', 'PARTIAL', 'PROCESSING', 'FAILED'] } };
         const skip = (page - 1) * limit;
 
         const [posts, total] = await Promise.all([
@@ -239,7 +345,7 @@ class PrismaAdapter {
                 take: limit,
                 select: {
                     id: true, caption: true, file_path: true, file_name: true, file_type: true, status: true, created_at: true, updated_at: true,
-                    users: { select: { id: true, name: true } },
+                    clients: { select: { id: true, name: true } },
                     post_accounts: {
                         select: {
                             delivery_status: true,
@@ -253,9 +359,9 @@ class PrismaAdapter {
         ]);
 
         return {
-            posts: posts.map(({ post_accounts, users, ...post }) => ({
+            posts: posts.map(({ post_accounts, clients, ...post }) => ({
                 ...post,
-                author: users,
+                author: clients,
                 accounts: post_accounts.map(vinculo => ({
                     ...vinculo.accounts,
                     delivery_status: vinculo.delivery_status,

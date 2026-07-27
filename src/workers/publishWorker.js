@@ -36,14 +36,21 @@ async function registrarResultado (postId, accountId, status, apiPostId, errorMe
 }
 
 async function processarJob (job) {
-    const { postId, accountId, userId } = job.data;
+    const { postId, accountId, clientId } = job.data;
 
     const [post, conta] = await Promise.all([
         prismaAdapter.buscarPostPorId(postId),
-        prismaAdapter.buscarContaPorId(accountId, userId)
+        prismaAdapter.buscarContaPorId(accountId, clientId)
     ]);
 
     if (!post || !conta) throw new UnrecoverableError(`Post ${postId} ou conta ${accountId} não encontrado(a).`);
+
+    // Primeiro job de um post agendado a rodar depois do delay do BullMQ: passa de SCHEDULED pra
+    // PROCESSING. Seguro sob concorrência (vários jobs do mesmo post): é só uma sobrescrita de string,
+    // e finalizarStatusSeCompleto sempre define o status final no fim.
+    if (post.status === 'SCHEDULED') {
+        await prismaAdapter.atualizarStatusPost(postId, 'PROCESSING');
+    }
 
     try {
         const accessToken = cryptoUtil.decrypt(conta.access_token);
@@ -53,7 +60,7 @@ async function processarJob (job) {
         await postService.finalizarStatusSeCompleto(postId);
     } catch (error) {
         if (error instanceof AppError) {
-            console.warn(`Falha ao publicar post ${postId} na conta ${accountId}`, { postId, accountId, userId, erro: error.message });
+            console.warn(`Falha ao publicar post ${postId} na conta ${accountId}`, { postId, accountId, clientId, erro: error.message });
             await registrarResultado(postId, accountId, 'FAILED', null, error.message);
             await postService.finalizarStatusSeCompleto(postId);
             throw new UnrecoverableError(error.message);
@@ -63,7 +70,7 @@ async function processarJob (job) {
         // for a última tentativa, senão o post fecharia status errado com um retry ainda pendente.
         const estaNaUltimaTentativa = job.attemptsMade + 1 >= job.opts.attempts;
         if (estaNaUltimaTentativa) {
-            console.error(`Erro inesperado ao publicar post ${postId} na conta ${accountId}`, { postId, accountId, userId, erro: error.message, stack: error.stack });
+            console.error(`Erro inesperado ao publicar post ${postId} na conta ${accountId}`, { postId, accountId, clientId, erro: error.message, stack: error.stack });
             await registrarResultado(postId, accountId, 'FAILED', null, 'Erro ao publicar nesta conta. Tente novamente mais tarde.');
             await postService.finalizarStatusSeCompleto(postId);
         }

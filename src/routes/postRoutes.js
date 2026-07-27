@@ -37,6 +37,8 @@ const uploadMidia = multer({
 
 router.post('/upload/lote', authMiddleware.verificarToken, uploadMidia.single('arquivo'), postController.publicarEmLote);
 router.post('/upload/draft', authMiddleware.verificarToken, uploadMidia.single('arquivo'), postController.salvarDraft);
+router.post('/upload/schedule', authMiddleware.verificarToken, uploadMidia.single('arquivo'), postController.agendarPostagem);
+router.delete('/schedule/:id', authMiddleware.verificarToken, postController.cancelarAgendamento);
 router.post('/draft/:id/publish', authMiddleware.verificarToken, postController.publicarDraft);
 router.put('/draft/:id', authMiddleware.verificarToken, postController.atualizarDraft);
 router.delete('/draft/:id', authMiddleware.verificarToken, postController.excluirDraft);
@@ -44,5 +46,6 @@ router.get('/draft/:id', authMiddleware.verificarToken, postController.buscarDra
 router.get('/drafts', authMiddleware.verificarToken, postController.listarDrafts);
 
 router.get('/feed', authMiddleware.verificarToken, postController.listarFeed);
+router.get('/posts/:id/status', authMiddleware.verificarToken, postController.consultarStatusPost);
 
 module.exports = router;

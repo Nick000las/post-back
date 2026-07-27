@@ -14,16 +14,36 @@ class PostService {
         }
     }
 
+    // Confere que o client pertence ao usuário autenticado (agência) antes de liberar qualquer
+    // operação nas contas/posts desse client.
+    static async #validarCliente (clientId, userId) {
+        const cliente = await prismaAdapter.buscarClientePorId(clientId, userId);
+        if (!cliente) throw new AppError('Cliente não encontrado');
+        return cliente;
+    }
+
     // A tentativa de publicar em si (e o registro de sucesso/falha por conta) migrou pro worker
-    // (src/workers/publishWorker.js) — aqui só marcamos o post como "em processamento" e enfileiramos.
-    static async #enfileirarContas (post, accountsList, userId) {
-        await prismaAdapter.atualizarStatusPost(post.id, 'PROCESSING');
+    // (src/workers/publishWorker.js) — aqui só marcamos o post e enfileiramos.
+    // opts.delayMs: usado pelo agendamento (undefined = publica assim que possível).
+    // opts.statusInicial: 'PROCESSING' (padrão, publicação imediata) ou 'SCHEDULED' (aguardando o horário agendado).
+    static async #enfileirarContas (post, accountsList, clientId, opts = {}) {
+        const { delayMs, statusInicial = 'PROCESSING' } = opts;
 
-        await Promise.all(
-            accountsList.map(account => publishQueue.add('publicar-conta', { postId: post.id, accountId: account.id, userId }))
-        );
+        await prismaAdapter.atualizarStatusPost(post.id, statusInicial);
 
-        return { status: 'queued', postId: post.id, totalContas: accountsList.length };
+        const jobOpts = delayMs ? { delay: delayMs } : {};
+        await Promise.all(accountsList.map(async account => {
+            const job = await publishQueue.add('publicar-conta', { postId: post.id, accountId: account.id, clientId }, jobOpts);
+            if (statusInicial === 'SCHEDULED') {
+                await prismaAdapter.registrarJobAgendado(post.id, account.id, job.id);
+            }
+        }));
+
+        return {
+            status: statusInicial === 'SCHEDULED' ? 'scheduled' : 'queued',
+            postId: post.id,
+            totalContas: accountsList.length
+        };
     }
 
     // Chamado pelo worker depois de cada job (sucesso ou falha definitiva) pra fechar o status do post
@@ -40,8 +60,10 @@ class PostService {
         await prismaAdapter.atualizarStatusPost(postId, statusFinal);
     }
 
-    static async gerenciarPostagemEmLote (arquivo, caption, accountsList, userId) {
-        const novoPost = await prismaAdapter.criarPost(caption, arquivo.filename, arquivo.originalname, arquivo.mimetype, 'DRAFT', userId);
+    static async gerenciarPostagemEmLote (arquivo, caption, accountsList, clientId, userId) {
+        await this.#validarCliente(clientId, userId);
+
+        const novoPost = await prismaAdapter.criarPost(caption, arquivo.filename, arquivo.originalname, arquivo.mimetype, 'DRAFT', clientId);
 
         const post = {
             id: novoPost.id,
@@ -50,46 +72,116 @@ class PostService {
             file_name: arquivo.originalname,
             file_type: arquivo.mimetype
         };
-        return this.#enfileirarContas(post, accountsList, userId);
+        return this.#enfileirarContas(post, accountsList, clientId);
     }
 
-    static async criarDraft (caption, arquivo, accountIds, userId) {
+    static async agendarPostagem (arquivo, caption, accountsList, scheduledFor, clientId, userId) {
+        await this.#validarCliente(clientId, userId);
+
+        const FORMATO_ISO_COM_FUSO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+        if (typeof scheduledFor !== 'string' || !FORMATO_ISO_COM_FUSO.test(scheduledFor)) {
+            throw new AppError('Data de agendamento inválida. Use ISO 8601 com fuso horário explícito (ex.: 2026-08-01T10:00:00-03:00).');
+        }
+
+        const data = new Date(scheduledFor);
+        const delayMs = data.getTime() - Date.now();
+        if (Number.isNaN(delayMs) || delayMs <= 0) {
+            throw new AppError('A data de agendamento precisa estar no futuro.');
+        }
+
+        const novoPost = await prismaAdapter.criarPost(caption, arquivo.filename, arquivo.originalname, arquivo.mimetype, 'SCHEDULED', clientId, data);
+
+        const post = {
+            id: novoPost.id,
+            caption,
+            file_path: arquivo.filename,
+            file_name: arquivo.originalname,
+            file_type: arquivo.mimetype
+        };
+
+        return this.#enfileirarContas(post, accountsList, clientId, { delayMs, statusInicial: 'SCHEDULED' });
+    }
+
+    static async consultarStatusPost (postId, clientId, userId) {
+        await this.#validarCliente(clientId, userId);
+
+        const post = await prismaAdapter.buscarPostComStatusContas(postId, clientId);
+        if (!post) throw new AppError('Post não encontrado');
+
+        return { postId: post.id, status: post.status, accounts: post.accounts };
+    }
+
+    static async cancelarAgendamento (postId, clientId, userId) {
+        await this.#validarCliente(clientId, userId);
+
+        const post = await prismaAdapter.buscarPostAgendadoComJobs(postId, clientId);
+        if (!post) throw new AppError('Post agendado não encontrado ou já iniciado');
+
+        await Promise.all(post.post_accounts.map(async ({ job_id }) => {
+            if (!job_id) return;
+            try {
+                const job = await publishQueue.getJob(job_id);
+                if (job && (await job.getState()) === 'delayed') await job.remove();
+            } catch (erro) {
+                console.warn('Falha ao remover job agendado da fila', { postId, job_id, erro: erro.message });
+            }
+        }));
+
+        const postExcluido = await prismaAdapter.excluirPostAgendado(postId, clientId);
+        this.#removerArquivoLocal({ path: path.join(UPLOADS_DIR, postExcluido.file_path) });
+
+        return { message: 'Agendamento cancelado com sucesso', postId };
+    }
+
+    static async criarDraft (caption, arquivo, accountIds, clientId, userId) {
+        await this.#validarCliente(clientId, userId);
+
         if (!Array.isArray(accountIds) || accountIds.length === 0) {
             throw new AppError('Selecione ao menos uma conta para o rascunho');
         }
 
-        return prismaAdapter.criarDraftComContas(caption, arquivo.originalname, arquivo.filename, arquivo.mimetype, userId, accountIds);
+        return prismaAdapter.criarDraftComContas(caption, arquivo.originalname, arquivo.filename, arquivo.mimetype, clientId, accountIds);
     }
 
-    static async publicarDraft (draftId, userId) {
-        const draft = await prismaAdapter.buscarDraftPorId(draftId, userId);
+    static async publicarDraft (draftId, clientId, userId) {
+        await this.#validarCliente(clientId, userId);
+
+        const draft = await prismaAdapter.buscarDraftPorId(draftId, clientId);
         if (!draft) throw new AppError('Draft não encontrado');
 
-        const contasVinculadas = await prismaAdapter.listarContasDoDraft(draftId, userId);
+        const contasVinculadas = await prismaAdapter.listarContasDoDraft(draftId, clientId);
         if (contasVinculadas.length === 0) throw new AppError('Este rascunho não possui contas vinculadas');
 
-        return this.#enfileirarContas(draft, contasVinculadas, userId);
+        return this.#enfileirarContas(draft, contasVinculadas, clientId);
     }
 
-    static async atualizarDraft (draftId, caption, userId) {
-        const draftAtualizado = await prismaAdapter.atualizarDraft(draftId, caption, userId);
+    static async atualizarDraft (draftId, caption, clientId, userId) {
+        await this.#validarCliente(clientId, userId);
+
+        const draftAtualizado = await prismaAdapter.atualizarDraft(draftId, caption, clientId);
         if (!draftAtualizado) throw new AppError('Draft não encontrado');
         return draftAtualizado;
     }
 
-    static async buscarDraft (draftId, userId) {
-        const draft = await prismaAdapter.buscarDraftComContas(draftId, userId);
+    static async buscarDraft (draftId, clientId, userId) {
+        await this.#validarCliente(clientId, userId);
+
+        const draft = await prismaAdapter.buscarDraftComContas(draftId, clientId);
         if (!draft) throw new AppError('Draft não encontrado');
         return draft;
     }
 
-    static async listarDrafts (userId) {
-        const drafts = await prismaAdapter.listarDrafts(userId);
+    static async listarDrafts (clientId, userId) {
+        await this.#validarCliente(clientId, userId);
+
+        const drafts = await prismaAdapter.listarDrafts(clientId);
         return drafts;
     }
 
-    static async excluirDraft (draftId, userId) {
-        const draft = await prismaAdapter.excluirDraft(draftId, userId);
+    static async excluirDraft (draftId, clientId, userId) {
+        await this.#validarCliente(clientId, userId);
+
+        const draft = await prismaAdapter.excluirDraft(draftId, clientId);
         if (!draft) throw new AppError('Draft não encontrado');
 
         this.#removerArquivoLocal({ path: path.join(UPLOADS_DIR, draft.file_path) });
