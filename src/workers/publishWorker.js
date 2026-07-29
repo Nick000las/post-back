@@ -1,3 +1,4 @@
+require('dotenv').config();
 const { Worker, UnrecoverableError } = require('bullmq');
 const connection = require('../config/redisConfig.js');
 const { PUBLISH_QUEUE_NAME } = require('../queues/publishQueue.js');
