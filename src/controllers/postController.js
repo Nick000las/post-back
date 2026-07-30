@@ -1,4 +1,5 @@
 const postService = require('../services/postService.js');
+const kanbanService = require('../services/kanbanService.js');
 const AppError = require('../errors/AppError.js');
 const { responderComErro } = require('../utils/httpErrorHandler.js');
 const fs = require('fs');
@@ -103,6 +104,22 @@ class PostController {
             return responderComErro(res, error, {
                 logContext: 'Erro ao consultar status da postagem:',
                 mensagemPadrao: 'Erro ao consultar o status da postagem'
+            });
+        }
+    }
+
+    // A barreira de segurança real contra mover pra Agendado/Finalizado vive em kanbanService.moverPost
+    // (lança AppError se a coluna de destino for fixa) — o bloqueio no frontend é só UX.
+    static async moverPost (req, res) {
+        const { id } = req.params;
+        try {
+            const { clientId, columnId } = req.body;
+            const post = await kanbanService.moverPost(id, clientId, req.user.id, columnId);
+            return res.status(200).json({ message: 'Post movido com sucesso', post });
+        } catch (error) {
+            return responderComErro(res, error, {
+                logContext: 'Erro ao mover post:',
+                mensagemPadrao: 'Erro ao mover o post'
             });
         }
     }

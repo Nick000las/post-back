@@ -1,6 +1,8 @@
 const prismaAdapter = require('../adapters/prismaAdapter.js');
 const AppError = require('../errors/AppError.js');
 const { publishQueue } = require('../queues/publishQueue.js');
+const kanbanService = require('./kanbanService.js');
+const thumbnailService = require('./thumbnailService.js');
 const fs = require('fs');
 const path = require('path');
 
@@ -20,6 +22,17 @@ class PostService {
         const cliente = await prismaAdapter.buscarClientePorId(clientId, userId);
         if (!cliente) throw new AppError('Cliente não encontrado');
         return cliente;
+    }
+
+    // Gancho de IA (Kanban): todo post criado passa por aqui pra decidir sua column_id. Se
+    // columnIdExplicito vier definido (futura rota de IA que já escolhe a coluna), usa ele; senão,
+    // cai por padrão na coluna "Ideias" do client. Este é o ÚNICO lugar que decide esse default —
+    // gerenciarPostagemEmLote/agendarPostagem/criarDraft chamam este método antes de criar o post.
+    static async #resolverColumnId (clientId, columnIdExplicito) {
+        if (columnIdExplicito !== undefined && columnIdExplicito !== null) {
+            return parseInt(columnIdExplicito);
+        }
+        return await kanbanService.resolverColunaIdeias(clientId);
     }
 
     // A tentativa de publicar em si (e o registro de sucesso/falha por conta) migrou pro worker
@@ -60,10 +73,12 @@ class PostService {
         await prismaAdapter.atualizarStatusPost(postId, statusFinal);
     }
 
-    static async gerenciarPostagemEmLote (arquivo, caption, accountsList, clientId, userId) {
+    static async gerenciarPostagemEmLote (arquivo, caption, accountsList, clientId, userId, columnIdExplicito) {
         await this.#validarCliente(clientId, userId);
 
-        const novoPost = await prismaAdapter.criarPost(caption, arquivo.filename, arquivo.originalname, arquivo.mimetype, 'DRAFT', clientId);
+        const columnId = await this.#resolverColumnId(clientId, columnIdExplicito);
+        const thumbnailPath = await thumbnailService.gerar(arquivo);
+        const novoPost = await prismaAdapter.criarPost(caption, arquivo.filename, arquivo.originalname, arquivo.mimetype, 'DRAFT', clientId, null, columnId, thumbnailPath);
 
         const post = {
             id: novoPost.id,
@@ -75,7 +90,7 @@ class PostService {
         return this.#enfileirarContas(post, accountsList, clientId);
     }
 
-    static async agendarPostagem (arquivo, caption, accountsList, scheduledFor, clientId, userId) {
+    static async agendarPostagem (arquivo, caption, accountsList, scheduledFor, clientId, userId, columnIdExplicito) {
         await this.#validarCliente(clientId, userId);
 
         const FORMATO_ISO_COM_FUSO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
@@ -89,7 +104,9 @@ class PostService {
             throw new AppError('A data de agendamento precisa estar no futuro.');
         }
 
-        const novoPost = await prismaAdapter.criarPost(caption, arquivo.filename, arquivo.originalname, arquivo.mimetype, 'SCHEDULED', clientId, data);
+        const columnId = await this.#resolverColumnId(clientId, columnIdExplicito);
+        const thumbnailPath = await thumbnailService.gerar(arquivo);
+        const novoPost = await prismaAdapter.criarPost(caption, arquivo.filename, arquivo.originalname, arquivo.mimetype, 'SCHEDULED', clientId, data, columnId, thumbnailPath);
 
         const post = {
             id: novoPost.id,
@@ -133,14 +150,16 @@ class PostService {
         return { message: 'Agendamento cancelado com sucesso', postId };
     }
 
-    static async criarDraft (caption, arquivo, accountIds, clientId, userId) {
+    static async criarDraft (caption, arquivo, accountIds, clientId, userId, columnIdExplicito) {
         await this.#validarCliente(clientId, userId);
 
         if (!Array.isArray(accountIds) || accountIds.length === 0) {
             throw new AppError('Selecione ao menos uma conta para o rascunho');
         }
 
-        return prismaAdapter.criarDraftComContas(caption, arquivo.originalname, arquivo.filename, arquivo.mimetype, clientId, accountIds);
+        const columnId = await this.#resolverColumnId(clientId, columnIdExplicito);
+        const thumbnailPath = await thumbnailService.gerar(arquivo);
+        return prismaAdapter.criarDraftComContas(caption, arquivo.originalname, arquivo.filename, arquivo.mimetype, clientId, accountIds, columnId, thumbnailPath);
     }
 
     static async publicarDraft (draftId, clientId, userId) {

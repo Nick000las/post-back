@@ -1,5 +1,6 @@
 const { PrismaClient } = require('@prisma/client');
 const cryptoUtil = require('../utils/cryptoUtil.js');
+const { FIXED_COLUMN_KEYS, FIXED_COLUMNS_SEED } = require('../constants/kanban.js');
 const prisma = new PrismaClient();
 
 const CONTA_SELECT_SEGURO = {
@@ -8,6 +9,21 @@ const CONTA_SELECT_SEGURO = {
     platform: true,
     platform_account_id: true,
     created_at: true
+};
+
+// Campos base de post reaproveitados em todo select de leitura (drafts, feed, quadro kanban etc.) —
+// única fonte de verdade pra não esquecer um campo novo (ex.: thumbnail_path) em algum dos vários
+// pontos que selecionam post.
+const POST_SELECT_BASE = {
+    id: true,
+    caption: true,
+    file_path: true,
+    file_name: true,
+    file_type: true,
+    thumbnail_path: true,
+    status: true,
+    created_at: true,
+    updated_at: true
 };
 
 // accounts e posts pertencem a um client (não mais direto a um user) — todo método que antes
@@ -22,8 +38,20 @@ class PrismaAdapter {
     }
 
     static async criarClient(name, userId) {
-        return await prisma.clients.create({
-            data: { name, user_id: userId }
+        return await prisma.$transaction(async (tx) => {
+            const client = await tx.clients.create({
+                data: { name, user_id: userId }
+            });
+
+            await tx.columns.createMany({
+                data: FIXED_COLUMNS_SEED.map(coluna => ({
+                    ...coluna,
+                    is_fixed: true,
+                    client_id: client.id
+                }))
+            });
+
+            return client;
         });
     }
 
@@ -54,6 +82,125 @@ class PrismaAdapter {
         return client;
     }
 
+    // ---- Kanban: colunas ----
+
+    static async listarColunas(clientId) {
+        return await prisma.columns.findMany({
+            where: { client_id: parseInt(clientId) },
+            orderBy: { order: 'asc' }
+        });
+    }
+
+    static async buscarColunaPorId(id, clientId) {
+        return await prisma.columns.findFirst({
+            where: { id: parseInt(id), client_id: parseInt(clientId) }
+        });
+    }
+
+    // Ponto de resolução reutilizável do "gancho de IA": toda criação de post que não vier com
+    // column_id explícito cai aqui (via kanbanService.resolverColunaIdeias).
+    static async buscarColunaIdeias(clientId) {
+        return await prisma.columns.findFirst({
+            where: { client_id: parseInt(clientId), fixed_key: FIXED_COLUMN_KEYS.IDEIAS },
+            select: { id: true }
+        });
+    }
+
+    static async criarColunaDinamica(clientId, name) {
+        // A ordem base é sempre a da coluna Ideias (1000) + 1, nunca um valor fixo somado por fora —
+        // somar +1000 aqui colidiria com a própria Ideias (1000) e depois com Agendado (2000).
+        const [maiorOrderDinamica, colunaIdeias] = await Promise.all([
+            prisma.columns.aggregate({
+                where: { client_id: parseInt(clientId), is_fixed: false },
+                _max: { order: true }
+            }),
+            prisma.columns.findFirst({
+                where: { client_id: parseInt(clientId), fixed_key: FIXED_COLUMN_KEYS.IDEIAS },
+                select: { order: true }
+            })
+        ]);
+
+        const order = (maiorOrderDinamica._max.order ?? colunaIdeias.order) + 1;
+
+        return await prisma.columns.create({
+            data: { name, client_id: parseInt(clientId), order, is_fixed: false }
+        });
+    }
+
+    static async renomearColuna(id, clientId, name) {
+        // updateMany (não update) porque o where combina id + client_id + is_fixed — update() singular
+        // só aceita um identificador único. count === 0 cobre "não encontrada" OU "é fixa" (kanbanService
+        // já valida isso antes e lança AppError; isso aqui é só uma garantia extra no nível de query).
+        const resultado = await prisma.columns.updateMany({
+            where: { id: parseInt(id), client_id: parseInt(clientId), is_fixed: false },
+            data: { name }
+        });
+        if (resultado.count === 0) return null;
+
+        return await prisma.columns.findUnique({ where: { id: parseInt(id) } });
+    }
+
+    static async excluirColunaDinamica(id, clientId) {
+        return await prisma.$transaction(async (tx) => {
+            const coluna = await tx.columns.findFirst({
+                where: { id: parseInt(id), client_id: parseInt(clientId), is_fixed: false },
+                select: { id: true, name: true }
+            });
+            if (!coluna) return null;
+
+            const colunaIdeias = await tx.columns.findFirst({
+                where: { client_id: parseInt(clientId), fixed_key: FIXED_COLUMN_KEYS.IDEIAS },
+                select: { id: true }
+            });
+            if (!colunaIdeias) throw new Error(`Client ${clientId} sem coluna Ideias — inconsistência de dados`);
+
+            const { count: postsMovidos } = await tx.posts.updateMany({
+                where: { client_id: parseInt(clientId), column_id: parseInt(id) },
+                data: { column_id: colunaIdeias.id }
+            });
+
+            await tx.columns.delete({ where: { id: coluna.id } });
+            return { ...coluna, postsMovidos };
+        });
+    }
+
+    // NÃO valida aqui se a coluna de destino é fixa — essa regra de negócio vive só no kanbanService,
+    // que chama este método depois de validar.
+    static async moverPostDeColuna(postId, clientId, columnId) {
+        const resultado = await prisma.posts.updateMany({
+            where: { id: parseInt(postId), client_id: parseInt(clientId) },
+            data: { column_id: parseInt(columnId), updated_at: new Date() }
+        });
+        if (resultado.count === 0) return null;
+
+        return await prisma.posts.findUnique({ where: { id: parseInt(postId) } });
+    }
+
+    static async buscarQuadro(clientId) {
+        const columns = await prisma.columns.findMany({
+            where: { client_id: parseInt(clientId) },
+            orderBy: { order: 'asc' },
+            select: {
+                id: true, name: true, order: true, is_fixed: true, fixed_key: true,
+                posts: {
+                    select: {
+                        ...POST_SELECT_BASE,
+                        scheduled_for: true,
+                        post_accounts: { select: { accounts: { select: CONTA_SELECT_SEGURO } } }
+                    }
+                }
+            }
+        });
+
+        return columns.map(({ posts, ...column }) => ({
+            ...column,
+            posts: posts.map(({ post_accounts, ...post }) => ({
+                ...post,
+                accounts: post_accounts.map(vinculo => vinculo.accounts)
+            }))
+        }));
+    }
+
     static async buscarUsuarioPorEmail(email) {
         return await prisma.users.findUnique({
             where: { email }
@@ -72,7 +219,9 @@ class PrismaAdapter {
         });
     }
 
-    static async criarPost(caption, filePath, fileName, fileType, status, clientId, scheduledFor = null) {
+    // Este método só persiste o column_id recebido — quem decide o default (coluna Ideias quando vier
+    // null) é postService#resolverColumnId, chamado pelo caller antes de invocar este método.
+    static async criarPost(caption, filePath, fileName, fileType, status, clientId, scheduledFor = null, columnId = null, thumbnailPath = null) {
         return await prisma.posts.create({
             data: {
                 caption,
@@ -81,7 +230,9 @@ class PrismaAdapter {
                 file_type: fileType,
                 status,
                 client_id: parseInt(clientId),
-                scheduled_for: scheduledFor
+                scheduled_for: scheduledFor,
+                column_id: columnId,
+                thumbnail_path: thumbnailPath
             }
         });
     }
@@ -172,7 +323,7 @@ class PrismaAdapter {
         return conta;
     }
 
-    static async criarDraftComContas(caption, fileName, filePath, fileType, clientId, accountIds) {
+    static async criarDraftComContas(caption, fileName, filePath, fileType, clientId, accountIds, columnId = null, thumbnailPath = null) {
         return await prisma.$transaction(async (tx) => {
             const draft = await tx.posts.create({
                 data: {
@@ -181,7 +332,9 @@ class PrismaAdapter {
                     file_name: fileName,
                     file_type: fileType,
                     status: 'DRAFT',
-                    client_id: parseInt(clientId)
+                    client_id: parseInt(clientId),
+                    column_id: columnId,
+                    thumbnail_path: thumbnailPath
                 }
             });
 
@@ -200,7 +353,7 @@ class PrismaAdapter {
     static async buscarDraftPorId(draftId, clientId) {
         return await prisma.posts.findFirst({
             where: { id: parseInt(draftId), client_id: parseInt(clientId), status: 'DRAFT' },
-            select: { id: true, caption: true, file_path: true, file_name: true, file_type: true, status: true, created_at: true, updated_at: true }
+            select: POST_SELECT_BASE
         });
     }
 
@@ -274,7 +427,7 @@ class PrismaAdapter {
         const draft = await prisma.posts.findFirst({
             where: { id: parseInt(draftId), client_id: parseInt(clientId), status: 'DRAFT' },
             select: {
-                id: true, caption: true, file_path: true, file_name: true, file_type: true, status: true, created_at: true, updated_at: true,
+                ...POST_SELECT_BASE,
                 post_accounts: { select: { accounts: { select: CONTA_SELECT_SEGURO } } }
             }
         });
@@ -295,7 +448,7 @@ class PrismaAdapter {
     static async excluirDraft(draftId, clientId) {
         const draft = await prisma.posts.findFirst({
             where: { id: parseInt(draftId), client_id: parseInt(clientId), status: 'DRAFT' },
-            select: { id: true, caption: true, file_path: true, file_name: true, file_type: true, status: true, created_at: true, updated_at: true }
+            select: POST_SELECT_BASE
         });
         if (!draft) return null;
 
@@ -312,8 +465,7 @@ class PrismaAdapter {
 
         return await prisma.posts.findUnique({
             where: { id: parseInt(draftId) },
-            select: { id: true, caption: true, file_path: true, file_name: true, file_type: true, status: true, created_at: true, updated_at: true
-            }
+            select: POST_SELECT_BASE
         });
     }
 
@@ -322,7 +474,7 @@ class PrismaAdapter {
             where: { client_id: parseInt(clientId), status: 'DRAFT' },
             orderBy: { updated_at: 'desc' },
             select: {
-                id: true, caption: true, file_path: true, file_name: true, file_type: true, status: true, created_at: true, updated_at: true,
+                ...POST_SELECT_BASE,
                 post_accounts: { select: { accounts: { select: CONTA_SELECT_SEGURO } } }
             }
         });
@@ -344,7 +496,7 @@ class PrismaAdapter {
                 skip,
                 take: limit,
                 select: {
-                    id: true, caption: true, file_path: true, file_name: true, file_type: true, status: true, created_at: true, updated_at: true,
+                    ...POST_SELECT_BASE,
                     clients: { select: { id: true, name: true } },
                     post_accounts: {
                         select: {

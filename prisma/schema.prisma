@@ -17,6 +17,7 @@ model clients {
   users      users      @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_client_user")
   accounts   accounts[]
   posts      posts[]
+  columns    columns[]
 }
 
 model accounts {
@@ -48,19 +49,51 @@ model post_accounts {
 
 /// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
 model posts {
-  id            Int             @id @default(autoincrement())
-  caption       String?
-  file_path     String          @db.VarChar(255)
-  file_name     String?         @db.VarChar(255)
-  file_type     String?         @db.VarChar(100)
-  status        String          @default("DRAFT") @db.VarChar(20)
+  id             Int             @id @default(autoincrement())
+  caption        String?
+  file_path      String          @db.VarChar(255)
+  file_name      String?         @db.VarChar(255)
+  file_type      String?         @db.VarChar(100)
+  // Caminho (relativo a .uploads/thumbs/) da miniatura gerada no upload. Nullable: posts anteriores a
+  // essa feature não têm, e a geração pode falhar sem que isso derrube o upload principal — o
+  // frontend deve cair para file_path quando thumbnail_path for null.
+  thumbnail_path String?         @db.VarChar(255)
+  status         String          @default("DRAFT") @db.VarChar(20)
   // TODO (agendamento): horário alvo da publicação, em UTC. Preencher só quando status = 'SCHEDULED'.
-  scheduled_for DateTime?       @db.Timestamptz(6)
-  client_id     Int
-  created_at    DateTime?       @default(now()) @db.Timestamptz(6)
-  updated_at    DateTime?       @default(now()) @db.Timestamptz(6)
-  post_accounts post_accounts[]
-  clients       clients         @relation(fields: [client_id], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_post_client")
+  scheduled_for  DateTime?       @db.Timestamptz(6)
+  client_id      Int
+  // Kanban: coluna atual do post no quadro do client. Nullable só por segurança de migração — toda
+  // criação/movimentação de post no código é responsável por manter isso preenchido (ver
+  // postService#resolverColumnId). Sem coluna definida == deveria cair na coluna "Ideias" do client.
+  column_id      Int?
+  created_at     DateTime?       @default(now()) @db.Timestamptz(6)
+  updated_at     DateTime?       @default(now()) @db.Timestamptz(6)
+  post_accounts  post_accounts[]
+  clients        clients         @relation(fields: [client_id], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_post_client")
+  columns        columns?        @relation(fields: [column_id], references: [id], onDelete: SetNull, onUpdate: NoAction, map: "fk_post_column")
+
+  @@index([client_id, column_id])
+}
+
+// Colunas do quadro Kanban de um client. As 3 colunas fixas (Ideias/Agendado/Finalizado) são criadas
+// automaticamente na criação do client (ver prismaAdapter.criarClient) e nunca podem ser renomeadas,
+// reordenadas ou excluídas pela UI — só colunas dinâmicas (is_fixed = false) podem.
+model columns {
+  id         Int       @id @default(autoincrement())
+  client_id  Int
+  name       String    @db.VarChar(100)
+  order      Int
+  is_fixed   Boolean   @default(false)
+  // Discriminador estável das colunas fixas: 'IDEIAS' | 'AGENDADO' | 'FINALIZADO' | null (dinâmica).
+  // Nunca renomear estas strings depois de implementado — o gancho de IA (resolução da coluna default
+  // de um post novo) e o futuro salto automático de status dependem delas.
+  fixed_key  String?   @db.VarChar(20)
+  created_at DateTime? @default(now()) @db.Timestamptz(6)
+  clients    clients   @relation(fields: [client_id], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_column_client")
+  posts      posts[]
+
+  @@unique([client_id, fixed_key], map: "uq_column_client_fixed_key")
+  @@index([client_id, order])
 }
 
 model users {

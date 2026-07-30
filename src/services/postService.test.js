@@ -9,11 +9,18 @@ jest.mock('../adapters/prismaAdapter.js', () => ({
     excluirPostAgendado: jest.fn(),
     criarDraftComContas: jest.fn(),
     buscarDraftPorId: jest.fn(),
-    listarContasDoDraft: jest.fn()
+    listarContasDoDraft: jest.fn(),
+    // Kanban: buscarColunaIdeias é chamado por baixo dos panos (via kanbanService.resolverColunaIdeias)
+    // sempre que um post é criado sem columnId explícito — ou seja, em todo teste de criação de post.
+    buscarColunaIdeias: jest.fn()
 }));
 
 jest.mock('../queues/publishQueue.js', () => ({
     publishQueue: { add: jest.fn(), getJob: jest.fn() }
+}));
+
+jest.mock('./thumbnailService.js', () => ({
+    gerar: jest.fn()
 }));
 
 jest.mock('fs', () => ({
@@ -23,15 +30,19 @@ jest.mock('fs', () => ({
 
 const prismaAdapter = require('../adapters/prismaAdapter.js');
 const { publishQueue } = require('../queues/publishQueue.js');
+const thumbnailService = require('./thumbnailService.js');
 const postService = require('./postService.js');
 const AppError = require('../errors/AppError.js');
 
 const CLIENT_ID = 99;
 const USER_ID = 7;
+const IDEIAS_COLUMN_ID = 1001;
 
 describe('PostService', () => {
     beforeEach(() => {
         prismaAdapter.buscarClientePorId.mockResolvedValue({ id: CLIENT_ID, user_id: USER_ID });
+        prismaAdapter.buscarColunaIdeias.mockResolvedValue({ id: IDEIAS_COLUMN_ID });
+        thumbnailService.gerar.mockResolvedValue(null);
         publishQueue.add.mockResolvedValue({ id: 'job-1' });
     });
     afterEach(() => jest.clearAllMocks());
@@ -91,6 +102,11 @@ describe('PostService', () => {
             const resultado = await postService.gerenciarPostagemEmLote(arquivo, 'legenda', accounts, CLIENT_ID, USER_ID);
 
             expect(prismaAdapter.buscarClientePorId).toHaveBeenCalledWith(CLIENT_ID, USER_ID);
+            // scheduledFor precisa ser null aqui, não o columnId — já foi um bug real (columnId caindo
+            // na posição de scheduledFor por falta desse null).
+            expect(prismaAdapter.criarPost).toHaveBeenCalledWith(
+                'legenda', 'foo.jpg', 'foo-original.jpg', 'image/jpeg', 'DRAFT', CLIENT_ID, null, IDEIAS_COLUMN_ID, null
+            );
             expect(prismaAdapter.atualizarStatusPost).toHaveBeenCalledWith(42, 'PROCESSING');
             expect(publishQueue.add).toHaveBeenCalledTimes(2);
             expect(publishQueue.add).toHaveBeenCalledWith('publicar-conta', { postId: 42, accountId: 1, clientId: CLIENT_ID }, {});
@@ -162,7 +178,7 @@ describe('PostService', () => {
             const resultado = await postService.agendarPostagem(arquivo, 'c', accounts, scheduledFor, CLIENT_ID, USER_ID);
 
             expect(prismaAdapter.criarPost).toHaveBeenCalledWith(
-                'c', 'foo.jpg', 'foo-original.jpg', 'image/jpeg', 'SCHEDULED', CLIENT_ID, new Date(scheduledFor)
+                'c', 'foo.jpg', 'foo-original.jpg', 'image/jpeg', 'SCHEDULED', CLIENT_ID, new Date(scheduledFor), IDEIAS_COLUMN_ID, null
             );
             expect(prismaAdapter.atualizarStatusPost).toHaveBeenCalledWith(55, 'SCHEDULED');
             expect(publishQueue.add).toHaveBeenCalledWith(

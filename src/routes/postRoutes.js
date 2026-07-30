@@ -47,5 +47,6 @@ router.get('/drafts', authMiddleware.verificarToken, postController.listarDrafts
 
 router.get('/feed', authMiddleware.verificarToken, postController.listarFeed);
 router.get('/posts/:id/status', authMiddleware.verificarToken, postController.consultarStatusPost);
+router.put('/posts/:id/move', authMiddleware.verificarToken, postController.moverPost);
 
 module.exports = router;
