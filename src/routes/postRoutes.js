@@ -39,8 +39,13 @@ router.post('/upload/lote', authMiddleware.verificarToken, uploadMidia.single('a
 router.post('/upload/draft', authMiddleware.verificarToken, uploadMidia.single('arquivo'), postController.salvarDraft);
 router.post('/upload/schedule', authMiddleware.verificarToken, uploadMidia.single('arquivo'), postController.agendarPostagem);
 router.delete('/schedule/:id', authMiddleware.verificarToken, postController.cancelarAgendamento);
+router.put('/schedule/:id', authMiddleware.verificarToken, postController.alterarDataAgendamento);
+router.delete('/posts/:id', authMiddleware.verificarToken, postController.excluirPost);
 router.post('/draft/:id/publish', authMiddleware.verificarToken, postController.publicarDraft);
+router.post('/draft/:id/schedule', authMiddleware.verificarToken, postController.agendarDraft);
 router.put('/draft/:id', authMiddleware.verificarToken, postController.atualizarDraft);
+router.put('/draft/:id/media', authMiddleware.verificarToken, uploadMidia.single('arquivo'), postController.atualizarMidiaDraft);
+router.delete('/draft/:id/media', authMiddleware.verificarToken, postController.removerMidiaDraft);
 router.delete('/draft/:id', authMiddleware.verificarToken, postController.excluirDraft);
 router.get('/draft/:id', authMiddleware.verificarToken, postController.buscarDraft);
 router.get('/drafts', authMiddleware.verificarToken, postController.listarDrafts);

@@ -124,6 +124,7 @@ class PostController {
         }
     }
 
+    // Não exclui mais o post — reverte pra DRAFT. Ver postService.cancelarAgendamento.
     static async cancelarAgendamento (req, res) {
         const { id } = req.params;
         try {
@@ -134,6 +135,36 @@ class PostController {
             return responderComErro(res, error, {
                 logContext: 'Erro ao cancelar agendamento:',
                 mensagemPadrao: 'Erro ao cancelar o agendamento'
+            });
+        }
+    }
+
+    // "Alterar Data" no popup do card — post já está SCHEDULED, só reagenda os jobs existentes.
+    static async alterarDataAgendamento (req, res) {
+        const { id } = req.params;
+        try {
+            const { clientId, scheduled_for } = req.body;
+            const resultado = await postService.alterarDataAgendamento(id, clientId, req.user.id, scheduled_for);
+            return res.status(200).json(resultado);
+        } catch (error) {
+            return responderComErro(res, error, {
+                logContext: 'Erro ao alterar data de agendamento:',
+                mensagemPadrao: 'Erro ao alterar a data de agendamento'
+            });
+        }
+    }
+
+    // Lixeira do popup do Kanban — exclusão definitiva, em qualquer status.
+    static async excluirPost (req, res) {
+        const { id } = req.params;
+        try {
+            const { clientId } = req.query;
+            const resultado = await postService.excluirPost(id, clientId, req.user.id);
+            return res.status(200).json(resultado);
+        } catch (error) {
+            return responderComErro(res, error, {
+                logContext: 'Erro ao excluir post:',
+                mensagemPadrao: 'Erro ao excluir o post'
             });
         }
     }
@@ -172,6 +203,23 @@ class PostController {
         }
     }
 
+    // Agenda um draft/post existente sem duplicá-lo nem reenviar arquivo — diferente de
+    // agendarPostagem (multipart, sempre cria um post novo). Usado pelo Kanban pra agendar um card
+    // que já existe no quadro (ex.: em "Ideias").
+    static async agendarDraft (req, res) {
+        const { id } = req.params;
+        try {
+            const { clientId, scheduled_for } = req.body;
+            const resultado = await postService.agendarDraft(id, clientId, req.user.id, scheduled_for);
+            return res.status(202).json({ message: 'Draft agendado com sucesso', detalhes: resultado });
+        } catch (error) {
+            return responderComErro(res, error, {
+                logContext: 'Erro ao agendar draft:',
+                mensagemPadrao: 'Erro ao agendar o draft'
+            });
+        }
+    }
+
     static async atualizarDraft (req, res) {
         const { id } = req.params;
         try {
@@ -182,6 +230,40 @@ class PostController {
             return responderComErro(res, error, {
                 logContext: 'Erro ao atualizar draft:',
                 mensagemPadrao: 'Erro ao atualizar o draft'
+            });
+        }
+    }
+
+    // Editor de mídia do popup do Kanban — drag&drop ou clique no lápis substituem o arquivo do draft.
+    static async atualizarMidiaDraft (req, res) {
+        const { id } = req.params;
+        const arquivo = req.file;
+        try {
+            if (!arquivo) throw new AppError('Nenhum arquivo enviado');
+
+            const { clientId } = req.body;
+            const draftAtualizado = await postService.atualizarMidiaDraft(id, clientId, req.user.id, arquivo);
+            return res.status(200).json({ message: 'Mídia atualizada com sucesso', draft: draftAtualizado });
+        } catch (error) {
+            if (arquivo && fs.existsSync(arquivo.path)) fs.unlinkSync(arquivo.path);
+            return responderComErro(res, error, {
+                logContext: 'Erro ao atualizar mídia do draft:',
+                mensagemPadrao: 'Erro ao atualizar a mídia'
+            });
+        }
+    }
+
+    // Lixeira do popup do Kanban — remove a mídia, post continua DRAFT (só fica vazio).
+    static async removerMidiaDraft (req, res) {
+        const { id } = req.params;
+        try {
+            const { clientId } = req.query;
+            const draftAtualizado = await postService.removerMidiaDraft(id, clientId, req.user.id);
+            return res.status(200).json({ message: 'Mídia removida com sucesso', draft: draftAtualizado });
+        } catch (error) {
+            return responderComErro(res, error, {
+                logContext: 'Erro ao remover mídia do draft:',
+                mensagemPadrao: 'Erro ao remover a mídia'
             });
         }
     }

@@ -3,10 +3,12 @@ const AppError = require('../errors/AppError.js');
 const { publishQueue } = require('../queues/publishQueue.js');
 const kanbanService = require('./kanbanService.js');
 const thumbnailService = require('./thumbnailService.js');
+const { FIXED_COLUMN_KEYS } = require('../constants/kanban.js');
 const fs = require('fs');
 const path = require('path');
 
 const UPLOADS_DIR = '.uploads';
+const FORMATO_ISO_COM_FUSO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
 
 class PostService {
 
@@ -35,6 +37,21 @@ class PostService {
         return await kanbanService.resolverColunaIdeias(clientId);
     }
 
+    // Salto automático de coluna no Kanban: quando um post muda pra um status "de fase" (agendado ou
+    // finalizado, nos dois sentidos do termo), ele pula pra coluna fixa correspondente, sem passar pela
+    // validação de kanbanService.moverPost (que só existe pra bloquear o usuário movendo manualmente —
+    // esse bloqueio não se aplica aqui, é o próprio sistema movendo). Silencioso por design: um post
+    // sem coluna fixa configurada (inconsistência de dados) não pode derrubar o fluxo de publicação.
+    static async #moverParaColunaFixa (postId, clientId, fixedKey) {
+        try {
+            const coluna = await prismaAdapter.buscarColunaPorFixedKey(clientId, fixedKey);
+            if (!coluna) return;
+            await prismaAdapter.moverPostDeColuna(postId, clientId, coluna.id);
+        } catch (erro) {
+            console.error('Falha ao mover post automaticamente de coluna', { postId, clientId, fixedKey, erro: erro.message });
+        }
+    }
+
     // A tentativa de publicar em si (e o registro de sucesso/falha por conta) migrou pro worker
     // (src/workers/publishWorker.js) — aqui só marcamos o post e enfileiramos.
     // opts.delayMs: usado pelo agendamento (undefined = publica assim que possível).
@@ -43,6 +60,9 @@ class PostService {
         const { delayMs, statusInicial = 'PROCESSING' } = opts;
 
         await prismaAdapter.atualizarStatusPost(post.id, statusInicial);
+        if (statusInicial === 'SCHEDULED') {
+            await this.#moverParaColunaFixa(post.id, clientId, FIXED_COLUMN_KEYS.AGENDADO);
+        }
 
         const jobOpts = delayMs ? { delay: delayMs } : {};
         await Promise.all(accountsList.map(async account => {
@@ -59,6 +79,12 @@ class PostService {
         };
     }
 
+    static async #validarDataFutura(scheduledFor){
+        if (typeof scheduledFor !== 'string' || !FORMATO_ISO_COM_FUSO.test(scheduledFor)) {
+            throw new AppError('Data de agendamento inválida. Use ISO 8601 com fuso horário explícito (ex.: 2026-08-01T10:00:00-03:00).');
+        }
+    }
+
     // Chamado pelo worker depois de cada job (sucesso ou falha definitiva) pra fechar o status do post
     // quando todas as contas já tiverem sido processadas.
     static async finalizarStatusSeCompleto (postId) {
@@ -71,6 +97,11 @@ class PostService {
         const statusFinal = sucessos === 0 ? 'FAILED' : sucessos === contas.length ? 'PUBLISHED' : 'PARTIAL';
 
         await prismaAdapter.atualizarStatusPost(postId, statusFinal);
+
+        // O worker só tem postId/accountId no job.data — precisa buscar o post pra saber o client_id
+        // antes de conseguir resolver a coluna Finalizado desse client.
+        const post = await prismaAdapter.buscarPostPorId(postId);
+        if (post) await this.#moverParaColunaFixa(postId, post.client_id, FIXED_COLUMN_KEYS.FINALIZADO);
     }
 
     static async gerenciarPostagemEmLote (arquivo, caption, accountsList, clientId, userId, columnIdExplicito) {
@@ -92,11 +123,7 @@ class PostService {
 
     static async agendarPostagem (arquivo, caption, accountsList, scheduledFor, clientId, userId, columnIdExplicito) {
         await this.#validarCliente(clientId, userId);
-
-        const FORMATO_ISO_COM_FUSO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
-        if (typeof scheduledFor !== 'string' || !FORMATO_ISO_COM_FUSO.test(scheduledFor)) {
-            throw new AppError('Data de agendamento inválida. Use ISO 8601 com fuso horário explícito (ex.: 2026-08-01T10:00:00-03:00).');
-        }
+        await this.#validarDataFutura(scheduledFor);
 
         const data = new Date(scheduledFor);
         const delayMs = data.getTime() - Date.now();
@@ -128,6 +155,8 @@ class PostService {
         return { postId: post.id, status: post.status, accounts: post.accounts };
     }
 
+    // Cancelar agendamento NÃO apaga o post — reverte pra DRAFT (arte/legenda preservadas) e move o
+    // card de volta pra coluna Ideias, pra a agência poder reeditar/reagendar depois sem reupload.
     static async cancelarAgendamento (postId, clientId, userId) {
         await this.#validarCliente(clientId, userId);
 
@@ -144,10 +173,75 @@ class PostService {
             }
         }));
 
-        const postExcluido = await prismaAdapter.excluirPostAgendado(postId, clientId);
-        this.#removerArquivoLocal({ path: path.join(UPLOADS_DIR, postExcluido.file_path) });
+        const postRevertido = await prismaAdapter.reverterAgendamentoParaDraft(postId, clientId);
+        if (!postRevertido) throw new AppError('Post agendado não encontrado ou já iniciado');
 
-        return { message: 'Agendamento cancelado com sucesso', postId };
+        await this.#moverParaColunaFixa(postId, clientId, FIXED_COLUMN_KEYS.IDEIAS);
+
+        return { message: 'Agendamento cancelado. O post voltou a ser um rascunho.', postId: postRevertido.id };
+    }
+
+    // "Alterar Data" no popup: post JÁ está SCHEDULED (ao contrário de agendarDraft, que exige DRAFT).
+    // Em vez de cancelar+reagendar (recriaria jobs do zero), usa job.changeDelay do BullMQ pra
+    // reagendar os jobs já existentes na fila com o novo horário — mais barato e não perde o job_id
+    // já registrado em post_accounts.
+    static async alterarDataAgendamento (postId, clientId, userId, scheduledFor) {
+        await this.#validarCliente(clientId, userId);
+        await this.#validarDataFutura(scheduledFor);
+
+        const data = new Date(scheduledFor);
+        const novoDelayMs = data.getTime() - Date.now();
+        if (Number.isNaN(novoDelayMs) || novoDelayMs <= 0) {
+            throw new AppError('A data de agendamento precisa estar no futuro.');
+        }
+
+        const post = await prismaAdapter.buscarPostAgendadoComJobs(postId, clientId);
+        if (!post) throw new AppError('Post agendado não encontrado ou já iniciado');
+
+        await Promise.all(post.post_accounts.map(async ({ job_id }) => {
+            if (!job_id) return;
+            try {
+                const job = await publishQueue.getJob(job_id);
+                if (job && (await job.getState()) === 'delayed') await job.changeDelay(novoDelayMs);
+            } catch (erro) {
+                console.warn('Falha ao reagendar job', { postId, job_id, erro: erro.message });
+            }
+        }));
+
+        await prismaAdapter.atualizarScheduledFor(postId, data);
+
+        return { message: 'Data de agendamento atualizada com sucesso', postId, scheduled_for: data };
+    }
+
+    // Exclusão definitiva de post em qualquer status — usada pela lixeira do popup do Kanban. Some
+    // com o card, o arquivo em disco, o thumbnail e os comentários (cascade no schema). Se o post ainda
+    // estiver SCHEDULED com job(s) na fila, eles precisam ser removidos antes de excluir (mesmo cuidado
+    // de cancelarAgendamento — um job 'delayed' órfão tentaria publicar um post que não existe mais).
+    static async excluirPost (postId, clientId, userId) {
+        await this.#validarCliente(clientId, userId);
+
+        // Só existe job pra remover se o post ainda estava SCHEDULED — null aqui é esperado (e não é
+        // erro) pra draft/publicado/etc., que nunca tiveram job pendente na fila.
+        const postAgendado = await prismaAdapter.buscarPostAgendadoComJobs(postId, clientId);
+        if (postAgendado) {
+            await Promise.all(postAgendado.post_accounts.map(async ({ job_id }) => {
+                if (!job_id) return;
+                try {
+                    const job = await publishQueue.getJob(job_id);
+                    if (job && (await job.getState()) === 'delayed') await job.remove();
+                } catch (erro) {
+                    console.warn('Falha ao remover job agendado da fila', { postId, job_id, erro: erro.message });
+                }
+            }));
+        }
+
+        const post = await prismaAdapter.excluirPostDefinitivo(postId, clientId);
+        if (!post) throw new AppError('Post não encontrado');
+
+        // file_path pode ser null (post sem mídia — removida no editor do Kanban antes da exclusão).
+        if (post.file_path) this.#removerArquivoLocal({ path: path.join(UPLOADS_DIR, post.file_path) });
+
+        return { message: 'Post excluído com sucesso', postId };
     }
 
     static async criarDraft (caption, arquivo, accountIds, clientId, userId, columnIdExplicito) {
@@ -168,10 +262,38 @@ class PostService {
         const draft = await prismaAdapter.buscarDraftPorId(draftId, clientId);
         if (!draft) throw new AppError('Draft não encontrado');
 
+        if (!draft.file_path) throw new AppError('Adicione uma mídia antes de publicar');
         const contasVinculadas = await prismaAdapter.listarContasDoDraft(draftId, clientId);
         if (contasVinculadas.length === 0) throw new AppError('Este rascunho não possui contas vinculadas');
 
         return this.#enfileirarContas(draft, contasVinculadas, clientId);
+    }
+
+    // Análogo de publicarDraft, mas agendando em vez de publicar imediatamente. Existe pra permitir
+    // agendar um post que já está no Kanban (ex.: card em "Ideias") sem duplicar o post nem reenviar o
+    // arquivo — ao contrário de agendarPostagem (multipart, sempre cria um post novo).
+    static async agendarDraft (draftId, clientId, userId, scheduledFor) {
+        await this.#validarCliente(clientId, userId);
+        await this.#validarDataFutura(scheduledFor);
+
+
+        const data = new Date(scheduledFor);
+        const delayMs = data.getTime() - Date.now();
+        if (Number.isNaN(delayMs) || delayMs <= 0) {
+            throw new AppError('A data de agendamento precisa estar no futuro.');
+        }
+
+        const draft = await prismaAdapter.buscarDraftPorId(draftId, clientId);
+        if (!draft) throw new AppError('Draft não encontrado');
+
+        if (!draft.file_path) throw new AppError('Adicione uma mídia antes de agendar');
+
+        const contasVinculadas = await prismaAdapter.listarContasDoDraft(draftId, clientId);
+        if (contasVinculadas.length === 0) throw new AppError('Este rascunho não possui contas vinculadas');
+
+        await prismaAdapter.atualizarScheduledFor(draftId, data);
+
+        return this.#enfileirarContas(draft, contasVinculadas, clientId, { delayMs, statusInicial: 'SCHEDULED' });
     }
 
     static async atualizarDraft (draftId, caption, clientId, userId) {
@@ -179,6 +301,40 @@ class PostService {
 
         const draftAtualizado = await prismaAdapter.atualizarDraft(draftId, caption, clientId);
         if (!draftAtualizado) throw new AppError('Draft não encontrado');
+        return draftAtualizado;
+    }
+
+    // Substitui a mídia de um draft existente (drag&drop ou clique no lápis, no popup do Kanban).
+    // arquivo vem de req.file (multer), já salvo em disco pelo controller antes de chegar aqui.
+    static async atualizarMidiaDraft (draftId, clientId, userId, arquivo) {
+        await this.#validarCliente(clientId, userId);
+        const draftAtual = await prismaAdapter.buscarDraftPorId(draftId, clientId);
+        if (!draftAtual) throw new AppError('Draft não encontrado');
+
+        const thumbnailPath = await thumbnailService.gerar(arquivo);
+        const draftAtualizado = await prismaAdapter.atualizarMidiaDraft(draftId, clientId, {
+            filePath: arquivo.filename,
+            fileName: arquivo.originalname,
+            fileType: arquivo.mimetype,
+            thumbnailPath
+        });
+        if (!draftAtualizado) throw new AppError('Draft não encontrado');
+
+        if (draftAtual.file_path) this.#removerArquivoLocal({ path: path.join(UPLOADS_DIR, draftAtual.file_path) });
+        if (draftAtual.thumbnail_path) this.#removerArquivoLocal({ path: path.join(UPLOADS_DIR, 'thumbs', draftAtual.thumbnail_path) });
+        return draftAtualizado;
+    }
+
+    // Remove a mídia de um draft (lixeira no popup) — post continua DRAFT, só fica sem arquivo até o
+    // usuário anexar outro (ou publicar/agendar, o que passa a ser bloqueado enquanto estiver vazio).
+    static async removerMidiaDraft (draftId, clientId, userId) {
+        await this.#validarCliente(clientId, userId);
+        const draftAtual = await prismaAdapter.buscarDraftPorId(draftId, clientId);
+        if (!draftAtual) throw new AppError('Draft não encontrado');
+        const draftAtualizado = await prismaAdapter.removerMidiaDraft(draftId, clientId);
+        if (!draftAtualizado) throw new AppError('Draft não encontrado');
+        if (draftAtual.file_path) this.#removerArquivoLocal({ path: path.join(UPLOADS_DIR, draftAtual.file_path) });
+        if (draftAtual.thumbnail_path) this.#removerArquivoLocal({ path: path.join(UPLOADS_DIR, 'thumbs', draftAtual.thumbnail_path) });
         return draftAtualizado;
     }
 
@@ -203,7 +359,8 @@ class PostService {
         const draft = await prismaAdapter.excluirDraft(draftId, clientId);
         if (!draft) throw new AppError('Draft não encontrado');
 
-        this.#removerArquivoLocal({ path: path.join(UPLOADS_DIR, draft.file_path) });
+        // file_path pode ser null (draft sem mídia — removida no editor do Kanban antes da exclusão).
+        if (draft.file_path) this.#removerArquivoLocal({ path: path.join(UPLOADS_DIR, draft.file_path) });
         return draft;
     }
 

@@ -9,6 +9,7 @@ const userRoutes = require('./routes/userRoutes.js');
 const authRoutes = require('./routes/authRoutes.js');
 const clientRoutes = require('./routes/clientRoutes.js');
 const kanbanRoutes = require('./routes/kanbanRoutes.js');
+const commentRoutes = require('./routes/commentRoutes.js');
 
 const app = express();
 app.use(cors({
@@ -28,6 +29,7 @@ app.use('/', userRoutes);
 app.use('/', authRoutes);
 app.use('/', clientRoutes);
 app.use('/', kanbanRoutes);
+app.use('/', commentRoutes);
 
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);

@@ -2,17 +2,26 @@ jest.mock('../adapters/prismaAdapter.js', () => ({
     buscarClientePorId: jest.fn(),
     criarPost: jest.fn(),
     atualizarStatusPost: jest.fn(),
+    atualizarScheduledFor: jest.fn(),
     listarStatusContasDoPost: jest.fn(),
     registrarJobAgendado: jest.fn(),
     buscarPostComStatusContas: jest.fn(),
     buscarPostAgendadoComJobs: jest.fn(),
-    excluirPostAgendado: jest.fn(),
+    reverterAgendamentoParaDraft: jest.fn(),
+    excluirPostDefinitivo: jest.fn(),
     criarDraftComContas: jest.fn(),
     buscarDraftPorId: jest.fn(),
+    atualizarMidiaDraft: jest.fn(),
+    removerMidiaDraft: jest.fn(),
+    buscarPostPorId: jest.fn(),
     listarContasDoDraft: jest.fn(),
     // Kanban: buscarColunaIdeias é chamado por baixo dos panos (via kanbanService.resolverColunaIdeias)
     // sempre que um post é criado sem columnId explícito — ou seja, em todo teste de criação de post.
-    buscarColunaIdeias: jest.fn()
+    buscarColunaIdeias: jest.fn(),
+    // Salto automático de coluna (SCHEDULED -> Agendado, status final -> Finalizado): chamado por
+    // #moverParaColunaFixa em todo teste de #enfileirarContas/finalizarStatusSeCompleto.
+    buscarColunaPorFixedKey: jest.fn(),
+    moverPostDeColuna: jest.fn()
 }));
 
 jest.mock('../queues/publishQueue.js', () => ({
@@ -42,6 +51,8 @@ describe('PostService', () => {
     beforeEach(() => {
         prismaAdapter.buscarClientePorId.mockResolvedValue({ id: CLIENT_ID, user_id: USER_ID });
         prismaAdapter.buscarColunaIdeias.mockResolvedValue({ id: IDEIAS_COLUMN_ID });
+        prismaAdapter.buscarPostPorId.mockResolvedValue({ id: 1, client_id: CLIENT_ID });
+        prismaAdapter.buscarColunaPorFixedKey.mockResolvedValue({ id: 2002 });
         thumbnailService.gerar.mockResolvedValue(null);
         publishQueue.add.mockResolvedValue({ id: 'job-1' });
     });
@@ -89,6 +100,24 @@ describe('PostService', () => {
             await postService.finalizarStatusSeCompleto(1);
 
             expect(prismaAdapter.atualizarStatusPost).toHaveBeenCalledWith(1, 'PARTIAL');
+        });
+
+        test('move o post pra coluna fixa "Finalizado" ao fechar o status', async () => {
+            prismaAdapter.listarStatusContasDoPost.mockResolvedValue([{ delivery_status: 'SUCCESS' }]);
+            prismaAdapter.buscarPostPorId.mockResolvedValue({ id: 1, client_id: CLIENT_ID });
+
+            await postService.finalizarStatusSeCompleto(1);
+
+            expect(prismaAdapter.buscarColunaPorFixedKey).toHaveBeenCalledWith(CLIENT_ID, 'FINALIZADO');
+            expect(prismaAdapter.moverPostDeColuna).toHaveBeenCalledWith(1, CLIENT_ID, 2002);
+        });
+
+        test('não quebra o fechamento de status se o post não for encontrado (inconsistência de dados)', async () => {
+            prismaAdapter.listarStatusContasDoPost.mockResolvedValue([{ delivery_status: 'SUCCESS' }]);
+            prismaAdapter.buscarPostPorId.mockResolvedValue(null);
+
+            await expect(postService.finalizarStatusSeCompleto(1)).resolves.not.toThrow();
+            expect(prismaAdapter.moverPostDeColuna).not.toHaveBeenCalled();
         });
     });
 
@@ -188,6 +217,10 @@ describe('PostService', () => {
             expect(prismaAdapter.registrarJobAgendado).toHaveBeenCalledWith(55, 2, 'job-b');
             expect(resultado).toEqual({ status: 'scheduled', postId: 55, totalContas: 2 });
 
+            // Salto automático de coluna: SCHEDULED move o post pra coluna fixa "Agendado".
+            expect(prismaAdapter.buscarColunaPorFixedKey).toHaveBeenCalledWith(CLIENT_ID, 'AGENDADO');
+            expect(prismaAdapter.moverPostDeColuna).toHaveBeenCalledWith(55, CLIENT_ID, 2002);
+
             jest.useRealTimers();
         });
     });
@@ -225,20 +258,23 @@ describe('PostService', () => {
     });
 
     describe('cancelarAgendamento', () => {
+        // Mudança de semântica: cancelar NÃO exclui mais o post — reverte pra DRAFT. Estes testes
+        // documentam o contrato esperado; os TODOs de postService.cancelarAgendamento ainda precisam
+        // ser implementados pra eles passarem (esqueleto, não lógica pronta).
         test('lança AppError quando não há post agendado correspondente', async () => {
             prismaAdapter.buscarPostAgendadoComJobs.mockResolvedValue(null);
 
             await expect(postService.cancelarAgendamento(1, CLIENT_ID, USER_ID)).rejects.toThrow(AppError);
-            expect(prismaAdapter.excluirPostAgendado).not.toHaveBeenCalled();
+            expect(prismaAdapter.reverterAgendamentoParaDraft).not.toHaveBeenCalled();
         });
 
-        test('remove apenas os jobs em estado delayed, exclui o post e retorna sucesso', async () => {
+        test('remove apenas os jobs em estado delayed, reverte o post pra DRAFT e move pra Ideias', async () => {
             prismaAdapter.buscarPostAgendadoComJobs.mockResolvedValue({
                 id: 8,
                 file_path: 'foo.jpg',
                 post_accounts: [{ job_id: 'job-a' }, { job_id: 'job-b' }, { job_id: null }]
             });
-            prismaAdapter.excluirPostAgendado.mockResolvedValue({ id: 8, file_path: 'foo.jpg' });
+            prismaAdapter.reverterAgendamentoParaDraft.mockResolvedValue({ id: 8, status: 'DRAFT' });
 
             const jobDelayed = { getState: jest.fn().mockResolvedValue('delayed'), remove: jest.fn() };
             const jobAtivo = { getState: jest.fn().mockResolvedValue('active'), remove: jest.fn() };
@@ -249,8 +285,90 @@ describe('PostService', () => {
             expect(jobDelayed.remove).toHaveBeenCalled();
             expect(jobAtivo.remove).not.toHaveBeenCalled();
             expect(publishQueue.getJob).toHaveBeenCalledTimes(2); // job_id null é ignorado
-            expect(prismaAdapter.excluirPostAgendado).toHaveBeenCalledWith(8, CLIENT_ID);
-            expect(resultado).toEqual({ message: 'Agendamento cancelado com sucesso', postId: 8 });
+            expect(prismaAdapter.reverterAgendamentoParaDraft).toHaveBeenCalledWith(8, CLIENT_ID);
+            expect(prismaAdapter.buscarColunaPorFixedKey).toHaveBeenCalledWith(CLIENT_ID, 'IDEIAS');
+            expect(prismaAdapter.moverPostDeColuna).toHaveBeenCalledWith(8, CLIENT_ID, 2002);
+            expect(resultado).toEqual({ message: 'Agendamento cancelado. O post voltou a ser um rascunho.', postId: 8 });
+        });
+    });
+
+    describe('alterarDataAgendamento', () => {
+        test('lança AppError se a nova data não tiver fuso horário explícito', async () => {
+            await expect(
+                postService.alterarDataAgendamento(1, CLIENT_ID, USER_ID, '2999-01-01T10:00:00')
+            ).rejects.toThrow(AppError);
+            expect(prismaAdapter.buscarPostAgendadoComJobs).not.toHaveBeenCalled();
+        });
+
+        test('lança AppError se a nova data estiver no passado', async () => {
+            await expect(
+                postService.alterarDataAgendamento(1, CLIENT_ID, USER_ID, '2020-01-01T00:00:00Z')
+            ).rejects.toThrow(AppError);
+        });
+
+        test('lança AppError quando não há post agendado correspondente', async () => {
+            prismaAdapter.buscarPostAgendadoComJobs.mockResolvedValue(null);
+
+            await expect(
+                postService.alterarDataAgendamento(1, CLIENT_ID, USER_ID, '2999-01-01T10:00:00Z')
+            ).rejects.toThrow(AppError);
+            expect(prismaAdapter.atualizarScheduledFor).not.toHaveBeenCalled();
+        });
+
+        test('reagenda os jobs existentes (changeDelay) e grava a nova data', async () => {
+            jest.useFakeTimers().setSystemTime(new Date('2026-01-01T00:00:00Z'));
+            prismaAdapter.buscarPostAgendadoComJobs.mockResolvedValue({
+                id: 8,
+                file_path: 'foo.jpg',
+                post_accounts: [{ job_id: 'job-a' }]
+            });
+            const job = { getState: jest.fn().mockResolvedValue('delayed'), changeDelay: jest.fn() };
+            publishQueue.getJob.mockResolvedValueOnce(job);
+
+            const scheduledFor = '2026-01-01T02:00:00Z'; // +2h
+            const resultado = await postService.alterarDataAgendamento(8, CLIENT_ID, USER_ID, scheduledFor);
+
+            expect(job.changeDelay).toHaveBeenCalledWith(7200000);
+            expect(prismaAdapter.atualizarScheduledFor).toHaveBeenCalledWith(8, new Date(scheduledFor));
+            expect(resultado).toEqual({ message: 'Data de agendamento atualizada com sucesso', postId: 8, scheduled_for: new Date(scheduledFor) });
+
+            jest.useRealTimers();
+        });
+    });
+
+    describe('excluirPost', () => {
+        test('lança AppError se o post não existe/não pertence ao cliente', async () => {
+            prismaAdapter.buscarPostAgendadoComJobs.mockResolvedValue(null);
+            prismaAdapter.excluirPostDefinitivo.mockResolvedValue(null);
+
+            await expect(postService.excluirPost(1, CLIENT_ID, USER_ID)).rejects.toThrow(AppError);
+        });
+
+        test('remove jobs pendentes (se houver) e exclui o post definitivamente', async () => {
+            prismaAdapter.buscarPostAgendadoComJobs.mockResolvedValue({
+                id: 8,
+                file_path: 'foo.jpg',
+                post_accounts: [{ job_id: 'job-a' }]
+            });
+            const jobDelayed = { getState: jest.fn().mockResolvedValue('delayed'), remove: jest.fn() };
+            publishQueue.getJob.mockResolvedValueOnce(jobDelayed);
+            prismaAdapter.excluirPostDefinitivo.mockResolvedValue({ id: 8, file_path: 'foo.jpg' });
+
+            const resultado = await postService.excluirPost(8, CLIENT_ID, USER_ID);
+
+            expect(jobDelayed.remove).toHaveBeenCalled();
+            expect(prismaAdapter.excluirPostDefinitivo).toHaveBeenCalledWith(8, CLIENT_ID);
+            expect(resultado).toEqual({ message: 'Post excluído com sucesso', postId: 8 });
+        });
+
+        test('exclui normalmente um post que não estava agendado (sem jobs pra remover)', async () => {
+            prismaAdapter.buscarPostAgendadoComJobs.mockResolvedValue(null);
+            prismaAdapter.excluirPostDefinitivo.mockResolvedValue({ id: 3, file_path: 'bar.jpg' });
+
+            const resultado = await postService.excluirPost(3, CLIENT_ID, USER_ID);
+
+            expect(publishQueue.getJob).not.toHaveBeenCalled();
+            expect(resultado).toEqual({ message: 'Post excluído com sucesso', postId: 3 });
         });
     });
 
@@ -262,8 +380,16 @@ describe('PostService', () => {
             expect(publishQueue.add).not.toHaveBeenCalled();
         });
 
+        test('lança AppError se o draft não tem mídia', async () => {
+            prismaAdapter.buscarDraftPorId.mockResolvedValue({ id: 1, file_path: null });
+
+            await expect(postService.publicarDraft(1, CLIENT_ID, USER_ID)).rejects.toThrow(AppError);
+            expect(prismaAdapter.listarContasDoDraft).not.toHaveBeenCalled();
+            expect(publishQueue.add).not.toHaveBeenCalled();
+        });
+
         test('lança AppError se o draft não tem contas vinculadas', async () => {
-            prismaAdapter.buscarDraftPorId.mockResolvedValue({ id: 1 });
+            prismaAdapter.buscarDraftPorId.mockResolvedValue({ id: 1, file_path: 'f' });
             prismaAdapter.listarContasDoDraft.mockResolvedValue([]);
 
             await expect(postService.publicarDraft(1, CLIENT_ID, USER_ID)).rejects.toThrow(AppError);
@@ -281,6 +407,138 @@ describe('PostService', () => {
             expect(prismaAdapter.atualizarStatusPost).toHaveBeenCalledWith(7, 'PROCESSING');
             expect(publishQueue.add).toHaveBeenCalledWith('publicar-conta', { postId: 7, accountId: 3, clientId: CLIENT_ID }, {});
             expect(resultado).toEqual({ status: 'queued', postId: 7, totalContas: 1 });
+        });
+    });
+
+    describe('agendarDraft', () => {
+        test('rejeita data sem fuso horário explícito', async () => {
+            await expect(
+                postService.agendarDraft(1, CLIENT_ID, USER_ID, '2999-01-01T10:00:00')
+            ).rejects.toThrow(AppError);
+            expect(prismaAdapter.buscarDraftPorId).not.toHaveBeenCalled();
+        });
+
+        test('rejeita data no passado', async () => {
+            await expect(
+                postService.agendarDraft(1, CLIENT_ID, USER_ID, '2020-01-01T00:00:00Z')
+            ).rejects.toThrow(AppError);
+            expect(publishQueue.add).not.toHaveBeenCalled();
+        });
+
+        test('lança AppError se o draft não existe', async () => {
+            prismaAdapter.buscarDraftPorId.mockResolvedValue(null);
+
+            await expect(
+                postService.agendarDraft(1, CLIENT_ID, USER_ID, '2999-01-01T10:00:00Z')
+            ).rejects.toThrow(AppError);
+            expect(publishQueue.add).not.toHaveBeenCalled();
+        });
+
+        test('lança AppError se o draft não tem mídia', async () => {
+            prismaAdapter.buscarDraftPorId.mockResolvedValue({ id: 1, file_path: null });
+
+            await expect(
+                postService.agendarDraft(1, CLIENT_ID, USER_ID, '2999-01-01T10:00:00Z')
+            ).rejects.toThrow(AppError);
+            expect(prismaAdapter.listarContasDoDraft).not.toHaveBeenCalled();
+        });
+
+        test('lança AppError se o draft não tem contas vinculadas', async () => {
+            prismaAdapter.buscarDraftPorId.mockResolvedValue({ id: 1, file_path: 'f' });
+            prismaAdapter.listarContasDoDraft.mockResolvedValue([]);
+
+            await expect(
+                postService.agendarDraft(1, CLIENT_ID, USER_ID, '2999-01-01T10:00:00Z')
+            ).rejects.toThrow(AppError);
+            expect(prismaAdapter.atualizarScheduledFor).not.toHaveBeenCalled();
+        });
+
+        test('caminho feliz: grava scheduled_for, marca SCHEDULED e move pra coluna Agendado', async () => {
+            jest.useFakeTimers().setSystemTime(new Date('2026-01-01T00:00:00Z'));
+            prismaAdapter.buscarDraftPorId.mockResolvedValue({
+                id: 9, caption: 'c', file_path: 'f', file_name: 'n', file_type: 'image/jpeg'
+            });
+            prismaAdapter.listarContasDoDraft.mockResolvedValue([{ id: 1 }]);
+            publishQueue.add.mockResolvedValueOnce({ id: 'job-a' });
+
+            const scheduledFor = '2026-01-01T01:00:00Z'; // +1h
+            const resultado = await postService.agendarDraft(9, CLIENT_ID, USER_ID, scheduledFor);
+
+            expect(prismaAdapter.atualizarScheduledFor).toHaveBeenCalledWith(9, new Date(scheduledFor));
+            expect(prismaAdapter.atualizarStatusPost).toHaveBeenCalledWith(9, 'SCHEDULED');
+            expect(publishQueue.add).toHaveBeenCalledWith(
+                'publicar-conta', { postId: 9, accountId: 1, clientId: CLIENT_ID }, { delay: 3600000 }
+            );
+            expect(prismaAdapter.registrarJobAgendado).toHaveBeenCalledWith(9, 1, 'job-a');
+            expect(prismaAdapter.buscarColunaPorFixedKey).toHaveBeenCalledWith(CLIENT_ID, 'AGENDADO');
+            expect(prismaAdapter.moverPostDeColuna).toHaveBeenCalledWith(9, CLIENT_ID, 2002);
+            expect(resultado).toEqual({ status: 'scheduled', postId: 9, totalContas: 1 });
+
+            jest.useRealTimers();
+        });
+    });
+
+    describe('atualizarMidiaDraft', () => {
+        const arquivo = { filename: 'novo.jpg', originalname: 'novo-original.jpg', mimetype: 'image/jpeg' };
+
+        test('lança AppError se o draft não existe', async () => {
+            prismaAdapter.buscarDraftPorId.mockResolvedValue(null);
+
+            await expect(
+                postService.atualizarMidiaDraft(1, CLIENT_ID, USER_ID, arquivo)
+            ).rejects.toThrow(AppError);
+            expect(thumbnailService.gerar).not.toHaveBeenCalled();
+            expect(prismaAdapter.atualizarMidiaDraft).not.toHaveBeenCalled();
+        });
+
+        test('lança AppError se o adapter não encontra o draft na hora de atualizar (corrida de status)', async () => {
+            prismaAdapter.buscarDraftPorId.mockResolvedValue({ id: 1, file_path: 'antigo.jpg', thumbnail_path: 'antigo-thumb.jpg' });
+            thumbnailService.gerar.mockResolvedValue('novo-thumb.jpg');
+            prismaAdapter.atualizarMidiaDraft.mockResolvedValue(null);
+
+            await expect(
+                postService.atualizarMidiaDraft(1, CLIENT_ID, USER_ID, arquivo)
+            ).rejects.toThrow(AppError);
+        });
+
+        test('gera thumbnail, atualiza o draft e repassa os dados corretos pro adapter', async () => {
+            prismaAdapter.buscarDraftPorId.mockResolvedValue({ id: 5, file_path: 'antigo.jpg', thumbnail_path: 'antigo-thumb.jpg' });
+            thumbnailService.gerar.mockResolvedValue('novo-thumb.jpg');
+            prismaAdapter.atualizarMidiaDraft.mockResolvedValue({ id: 5, file_path: 'novo.jpg' });
+
+            const resultado = await postService.atualizarMidiaDraft(5, CLIENT_ID, USER_ID, arquivo);
+
+            expect(thumbnailService.gerar).toHaveBeenCalledWith(arquivo);
+            expect(prismaAdapter.atualizarMidiaDraft).toHaveBeenCalledWith(5, CLIENT_ID, {
+                filePath: 'novo.jpg', fileName: 'novo-original.jpg', fileType: 'image/jpeg', thumbnailPath: 'novo-thumb.jpg'
+            });
+            expect(resultado).toEqual({ id: 5, file_path: 'novo.jpg' });
+        });
+    });
+
+    describe('removerMidiaDraft', () => {
+        test('lança AppError se o draft não existe', async () => {
+            prismaAdapter.buscarDraftPorId.mockResolvedValue(null);
+
+            await expect(postService.removerMidiaDraft(1, CLIENT_ID, USER_ID)).rejects.toThrow(AppError);
+            expect(prismaAdapter.removerMidiaDraft).not.toHaveBeenCalled();
+        });
+
+        test('lança AppError se o adapter não encontra o draft na hora de remover (corrida de status)', async () => {
+            prismaAdapter.buscarDraftPorId.mockResolvedValue({ id: 1, file_path: 'antigo.jpg' });
+            prismaAdapter.removerMidiaDraft.mockResolvedValue(null);
+
+            await expect(postService.removerMidiaDraft(1, CLIENT_ID, USER_ID)).rejects.toThrow(AppError);
+        });
+
+        test('remove a mídia e retorna o draft atualizado', async () => {
+            prismaAdapter.buscarDraftPorId.mockResolvedValue({ id: 5, file_path: 'antigo.jpg', thumbnail_path: 'antigo-thumb.jpg' });
+            prismaAdapter.removerMidiaDraft.mockResolvedValue({ id: 5, file_path: null, thumbnail_path: null });
+
+            const resultado = await postService.removerMidiaDraft(5, CLIENT_ID, USER_ID);
+
+            expect(prismaAdapter.removerMidiaDraft).toHaveBeenCalledWith(5, CLIENT_ID);
+            expect(resultado).toEqual({ id: 5, file_path: null, thumbnail_path: null });
         });
     });
 });

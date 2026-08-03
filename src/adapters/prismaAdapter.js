@@ -1,6 +1,6 @@
 const { PrismaClient } = require('@prisma/client');
 const cryptoUtil = require('../utils/cryptoUtil.js');
-const { FIXED_COLUMN_KEYS, FIXED_COLUMNS_SEED } = require('../constants/kanban.js');
+const { FIXED_COLUMN_KEYS, FIXED_COLUMNS_SEED, DIAS_VISIVEIS_COLUNA_FINALIZADO } = require('../constants/kanban.js');
 const prisma = new PrismaClient();
 
 const CONTA_SELECT_SEGURO = {
@@ -26,9 +26,20 @@ const POST_SELECT_BASE = {
     updated_at: true
 };
 
-// accounts e posts pertencem a um client (não mais direto a um user) — todo método que antes
-// filtrava por user_id agora filtra por client_id. postService/userService validam a posse do
-// client (buscarClientePorId) antes de repassar clientId pra cá.
+// Campos base de comentário reaproveitados em toda leitura de chat — já inclui o nome do autor
+// (users.name) achatado via select, pra frontend não precisar de uma segunda chamada.
+const COMMENT_SELECT_BASE = {
+    id: true,
+    post_id: true,
+    text: true,
+    attachment_path: true,
+    attachment_original_name: true,
+    attachment_mime_type: true,
+    attachment_size: true,
+    created_at: true,
+    users: { select: { id: true, name: true } }
+};
+
 
 class PrismaAdapter {
     static async buscarClientePorId(clientId, userId) {
@@ -106,9 +117,16 @@ class PrismaAdapter {
         });
     }
 
+    // Genérico: busca qualquer uma das 3 colunas fixas (Ideias/Agendado/Finalizado) do client. Usado
+    // pelo salto automático de coluna quando um post muda de status (ver postService#moverParaColunaFixa).
+    static async buscarColunaPorFixedKey(clientId, fixedKey) {
+        return await prisma.columns.findFirst({
+            where: { client_id: parseInt(clientId), fixed_key: fixedKey },
+            select: { id: true }
+        });
+    }
+
     static async criarColunaDinamica(clientId, name) {
-        // A ordem base é sempre a da coluna Ideias (1000) + 1, nunca um valor fixo somado por fora —
-        // somar +1000 aqui colidiria com a própria Ideias (1000) e depois com Agendado (2000).
         const [maiorOrderDinamica, colunaIdeias] = await Promise.all([
             prisma.columns.aggregate({
                 where: { client_id: parseInt(clientId), is_fixed: false },
@@ -128,9 +146,6 @@ class PrismaAdapter {
     }
 
     static async renomearColuna(id, clientId, name) {
-        // updateMany (não update) porque o where combina id + client_id + is_fixed — update() singular
-        // só aceita um identificador único. count === 0 cobre "não encontrada" OU "é fixa" (kanbanService
-        // já valida isso antes e lança AppError; isso aqui é só uma garantia extra no nível de query).
         const resultado = await prisma.columns.updateMany({
             where: { id: parseInt(id), client_id: parseInt(clientId), is_fixed: false },
             data: { name }
@@ -164,8 +179,7 @@ class PrismaAdapter {
         });
     }
 
-    // NÃO valida aqui se a coluna de destino é fixa — essa regra de negócio vive só no kanbanService,
-    // que chama este método depois de validar.
+
     static async moverPostDeColuna(postId, clientId, columnId) {
         const resultado = await prisma.posts.updateMany({
             where: { id: parseInt(postId), client_id: parseInt(clientId) },
@@ -192,13 +206,26 @@ class PrismaAdapter {
             }
         });
 
-        return columns.map(({ posts, ...column }) => ({
-            ...column,
-            posts: posts.map(({ post_accounts, ...post }) => ({
-                ...post,
-                accounts: post_accounts.map(vinculo => vinculo.accounts)
-            }))
-        }));
+        // Corte de retenção só da coluna Finalizado (ver DIAS_VISIVEIS_COLUNA_FINALIZADO) — usa
+        // updated_at como proxy de "quando finalizou": nada mais toca esse campo depois que o post
+        // entra em Finalizado (edição de legenda só existe pra DRAFT, e mover manualmente pra dentro
+        // dessa coluna já é bloqueado em kanbanService.moverPost).
+        const dataLimiteFinalizado = new Date();
+        dataLimiteFinalizado.setDate(dataLimiteFinalizado.getDate() - DIAS_VISIVEIS_COLUNA_FINALIZADO);
+
+        return columns.map(({ posts, ...column }) => {
+            const postsVisiveis = column.fixed_key === FIXED_COLUMN_KEYS.FINALIZADO
+                ? posts.filter(post => post.updated_at >= dataLimiteFinalizado)
+                : posts;
+
+            return {
+                ...column,
+                posts: postsVisiveis.map(({ post_accounts, ...post }) => ({
+                    ...post,
+                    accounts: post_accounts.map(vinculo => vinculo.accounts)
+                }))
+            };
+        });
     }
 
     static async buscarUsuarioPorEmail(email) {
@@ -219,8 +246,7 @@ class PrismaAdapter {
         });
     }
 
-    // Este método só persiste o column_id recebido — quem decide o default (coluna Ideias quando vier
-    // null) é postService#resolverColumnId, chamado pelo caller antes de invocar este método.
+
     static async criarPost(caption, filePath, fileName, fileType, status, clientId, scheduledFor = null, columnId = null, thumbnailPath = null) {
         return await prisma.posts.create({
             data: {
@@ -249,6 +275,13 @@ class PrismaAdapter {
         return await prisma.posts.update({
             where: { id: postId },
             data: { status, updated_at: new Date() }
+        });
+    }
+
+    static async atualizarScheduledFor(postId, scheduledFor) {
+        return await prisma.posts.update({
+            where: { id: parseInt(postId) },
+            data: { scheduled_for: scheduledFor, updated_at: new Date() }
         });
     }
 
@@ -286,7 +319,6 @@ class PrismaAdapter {
         });
     }
 
-    // contaData precisa trazer client_id (não mais user_id) — quem monta esse objeto é o caller.
     static async criarConta(contaData) {
         const dadosCriptografados = { ...contaData, access_token: cryptoUtil.encrypt(contaData.access_token) };
         return await prisma.accounts.create({
@@ -363,8 +395,38 @@ class PrismaAdapter {
         });
     }
 
-    // Usado pelo endpoint GET /posts/:id/status — busca o post filtrando por client_id (pra não
-    // vazar status de post de outro cliente) + post_accounts com delivery_status/error_message.
+   
+    static async buscarPostPorIdEClient(postId, clientId) {
+        return await prisma.posts.findFirst({ 
+            where: { id: parseInt(postId), client_id: parseInt(clientId) },
+            select: { id: true }
+        });
+    }
+
+    static async listarComentarios(postId) {
+        return await prisma.card_comments.findMany({
+            where: { post_id: parseInt(postId) },
+            orderBy: { created_at: 'asc' },
+            select: COMMENT_SELECT_BASE
+        });
+    }
+
+
+    static async criarComentario(postId, userId, text, dadosAnexo) {
+        return await prisma.card_comments.create({
+            data: {
+                post_id: parseInt(postId),
+                user_id: userId,
+                text,
+                attachment_path: dadosAnexo?.path ?? null,
+                attachment_original_name: dadosAnexo?.originalName ?? null,
+                attachment_mime_type: dadosAnexo?.mimeType ?? null,
+                attachment_size: dadosAnexo?.size ?? null
+            },
+            select: COMMENT_SELECT_BASE
+        });
+    }
+
     static async buscarPostComStatusContas(postId, clientId) {
         const post = await prisma.posts.findFirst({
             where: { id: parseInt(postId), client_id: parseInt(clientId) },
@@ -405,9 +467,24 @@ class PrismaAdapter {
         });
     }
 
-    static async excluirPostAgendado(postId, clientId) {
-        const post = await prisma.posts.findFirst({
+    // Cancelar agendamento não apaga mais o post — reverte pra DRAFT (arte/legenda preservadas), pra
+    // a agência poder reagendar depois sem refazer o upload. Retorna null se não achar um SCHEDULED
+    // com esse id+client (mesma regra de posse de sempre).
+    static async reverterAgendamentoParaDraft(postId, clientId) {
+        const resultado = await prisma.posts.updateMany({
             where: { id: parseInt(postId), client_id: parseInt(clientId), status: 'SCHEDULED' },
+            data: { status: 'DRAFT', scheduled_for: null, updated_at: new Date() }
+        });
+        if (resultado.count === 0) return null;
+        return prisma.posts.findUnique({ where: { id: parseInt(postId) }, select: POST_SELECT_BASE });
+    }
+
+    // Exclusão definitiva de post em QUALQUER status (ao contrário de excluirDraft, que só aceita
+    // DRAFT) — usada pelo botão de lixeira do popup do Kanban. card_comments tem onDelete: Cascade no
+    // schema, então os comentários somem junto automaticamente, sem precisar apagar nada à parte aqui.
+    static async excluirPostDefinitivo(postId, clientId) {
+        const post = await prisma.posts.findFirst({
+            where: { id: parseInt(postId), client_id: parseInt(clientId) },
             select: { id: true, file_path: true }
         });
         if (!post) return null;
@@ -463,6 +540,48 @@ class PrismaAdapter {
         });
         if (resultado.count === 0) return null;
 
+        return await prisma.posts.findUnique({
+            where: { id: parseInt(draftId) },
+            select: POST_SELECT_BASE
+        });
+    }
+
+    // Substitui a mídia de um draft existente (edição no popup do Kanban). dadosMidia já vem pronto do
+    // service: { filePath, fileName, fileType, thumbnailPath }. Mesmo padrão de atualizarDraft
+    // (updateMany + count check + findUnique) — só aceita se o post ainda for DRAFT.
+    static async atualizarMidiaDraft(draftId, clientId, dadosMidia) {
+        const resultado = await prisma.posts.updateMany({
+            where: { id: parseInt(draftId), client_id: parseInt(clientId), status: 'DRAFT' },
+            data: {
+                file_path: dadosMidia.filePath,
+                file_name: dadosMidia.fileName,
+                file_type: dadosMidia.fileType,
+                thumbnail_path: dadosMidia.thumbnailPath,
+                updated_at: new Date()
+            }
+        });
+        if(resultado.count === 0) return null;
+        return await prisma.posts.findUnique({
+            where: { id: parseInt(draftId) },
+            select: POST_SELECT_BASE
+        });
+    }
+
+    // Limpa a mídia de um draft (botão de lixeira) — post fica com file_path/file_name/file_type/
+    // thumbnail_path todos null, permanecendo DRAFT normalmente (só sem mídia até o usuário anexar
+    // outra). Mesmo padrão updateMany + count check + findUnique.
+    static async removerMidiaDraft(draftId, clientId) {
+        const resultado = await prisma.posts.updateMany({
+            where: { id: parseInt(draftId), client_id: parseInt(clientId), status: 'DRAFT' },
+            data: {
+                file_path: null,
+                file_name: null,
+                file_type: null,
+                thumbnail_path: null,
+                updated_at: new Date()
+            }
+        });
+        if(resultado.count === 0) return null;
         return await prisma.posts.findUnique({
             where: { id: parseInt(draftId) },
             select: POST_SELECT_BASE
