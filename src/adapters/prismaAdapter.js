@@ -11,6 +11,14 @@ const CONTA_SELECT_SEGURO = {
     created_at: true
 };
 
+// Campos do client expostos no card do Feed Global (autor do post) — mesmo padrão de
+// CONTA_SELECT_SEGURO, evita vazar user_id ou outros campos internos do client.
+const CLIENT_SELECT_FEED = {
+    id: true,
+    name: true,
+    avatar_path: true
+};
+
 // Campos base de post reaproveitados em todo select de leitura (drafts, feed, quadro kanban etc.) —
 // única fonte de verdade pra não esquecer um campo novo (ex.: thumbnail_path) em algum dos vários
 // pontos que selecionam post.
@@ -23,8 +31,13 @@ const POST_SELECT_BASE = {
     thumbnail_path: true,
     status: true,
     created_at: true,
-    updated_at: true
+    updated_at: true,
+    published_at: true
 };
+
+// Conjunto de status que aparece nos dois feeds — exclui DRAFT (rascunho ainda não é "conteúdo
+// entregue", nem pra troubleshooting nem pra portfólio).
+const FEED_STATUS_NAO_DRAFT = ['SCHEDULED', 'PROCESSING', 'PUBLISHED', 'PARTIAL', 'FAILED'];
 
 // Campos base de comentário reaproveitados em toda leitura de chat — já inclui o nome do autor
 // (users.name) achatado via select, pra frontend não precisar de uma segunda chamada.
@@ -271,10 +284,12 @@ class PrismaAdapter {
         });
     }
 
-    static async atualizarStatusPost(postId, status) {
+    // extra: campos adicionais pra mesclar no update (usado por postService#finalizarStatusSeCompleto
+    // pra gravar published_at junto com o status final, numa única query).
+    static async atualizarStatusPost(postId, status, extra = {}) {
         return await prisma.posts.update({
             where: { id: postId },
-            data: { status, updated_at: new Date() }
+            data: { status, updated_at: new Date(), ...extra }
         });
     }
 
@@ -294,8 +309,8 @@ class PrismaAdapter {
         };
 
         return await prisma.post_accounts.upsert({
-            where: { post_id_account_id: { post_id: postId, account_id: accountId } },
-            create: { post_id: postId, account_id: accountId, ...dados },
+            where: { post_id_account_id: { post_id: parseInt(postId), account_id: parseInt(accountId) } },
+            create: { post_id: parseInt(postId), account_id: parseInt(accountId), ...dados },
             update: dados
         });
     }
@@ -604,8 +619,35 @@ class PrismaAdapter {
         }));
     }
 
-    static async listarFeed(page, limit) {
-        const where = { status: { in: ['SCHEDULED', 'PUBLISHED', 'PARTIAL', 'PROCESSING', 'FAILED'] } };
+    // Achata post_accounts -> accounts (com delivery_status/error_message embutidos) e, quando
+    // incluirAutor, renomeia clients -> author. Fonte única de shaping reaproveitada pelos dois
+    // feeds, pra não duplicar esse .map() em cada método de listagem.
+    static #formatarPostDoFeed(post, { incluirAutor }) {
+        const { post_accounts, clients, ...resto } = post;
+
+        const postFormatado = {
+            ...resto,
+            accounts: post_accounts.map(vinculo => ({
+                ...vinculo.accounts,
+                delivery_status: vinculo.delivery_status,
+                error_message: vinculo.error_message
+            }))
+        };
+
+        return incluirAutor ? { ...postFormatado, author: clients } : postFormatado;
+    }
+
+    // Feed Global ("torre de controle"): cross-client, mas sempre escopado ao usuário autenticado
+    // (clients.user_id) — sem esse filtro, uma agência enxergaria posts de outra. clientId isola
+    // um único client (dropdown de filtro); intervalo filtra por updated_at (mesmo campo já usado
+    // na ordenação — "última atividade relevante", o que a torre de controle quer ver "hoje").
+    static async listarFeedGlobal({ userId, clientId, statusList, intervalo, page, limit }) {
+        const where = {
+            status: { in: statusList },
+            clients: { user_id: userId },
+            ...(clientId && { client_id: parseInt(clientId) }),
+            ...(intervalo && { updated_at: { gte: intervalo.from, lte: intervalo.to } })
+        };
         const skip = (page - 1) * limit;
 
         const [posts, total] = await Promise.all([
@@ -616,7 +658,7 @@ class PrismaAdapter {
                 take: limit,
                 select: {
                     ...POST_SELECT_BASE,
-                    clients: { select: { id: true, name: true } },
+                    clients: { select: CLIENT_SELECT_FEED },
                     post_accounts: {
                         select: {
                             delivery_status: true,
@@ -630,15 +672,52 @@ class PrismaAdapter {
         ]);
 
         return {
-            posts: posts.map(({ post_accounts, clients, ...post }) => ({
-                ...post,
-                author: clients,
-                accounts: post_accounts.map(vinculo => ({
-                    ...vinculo.accounts,
-                    delivery_status: vinculo.delivery_status,
-                    error_message: vinculo.error_message
-                }))
-            })),
+            posts: posts.map(post => PrismaAdapter.#formatarPostDoFeed(post, { incluirAutor: true })),
+            total
+        };
+    }
+
+    // Feed do Cliente ("vitrine/portfólio"): sempre de um único client (posse já validada pelo
+    // service via #validarCliente) — por design não busca nem expõe clients (author), já que o
+    // frontend já está no contexto do client. platform filtra por posts que tenham ao menos uma
+    // conta daquela rede; intervalo (mês/ano) filtra por published_at, com fallback pra updated_at
+    // nos posts anteriores à existência desse campo (published_at nulo).
+    static async listarFeedCliente({ clientId, platform, intervalo, page, limit }) {
+        const where = {
+            client_id: parseInt(clientId),
+            status: { in: FEED_STATUS_NAO_DRAFT },
+            ...(platform && { post_accounts: { some: { accounts: { platform } } } }),
+            ...(intervalo && {
+                OR: [
+                    { published_at: { gte: intervalo.from, lte: intervalo.to } },
+                    { published_at: null, updated_at: { gte: intervalo.from, lte: intervalo.to } }
+                ]
+            })
+        };
+        const skip = (page - 1) * limit;
+
+        const [posts, total] = await Promise.all([
+            prisma.posts.findMany({
+                where,
+                orderBy: { updated_at: 'desc' },
+                skip,
+                take: limit,
+                select: {
+                    ...POST_SELECT_BASE,
+                    post_accounts: {
+                        select: {
+                            delivery_status: true,
+                            error_message: true,
+                            accounts: { select: CONTA_SELECT_SEGURO }
+                        }
+                    }
+                }
+            }),
+            prisma.posts.count({ where })
+        ]);
+
+        return {
+            posts: posts.map(post => PrismaAdapter.#formatarPostDoFeed(post, { incluirAutor: false })),
             total
         };
     }

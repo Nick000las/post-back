@@ -50,7 +50,9 @@ router.delete('/draft/:id', authMiddleware.verificarToken, postController.exclui
 router.get('/draft/:id', authMiddleware.verificarToken, postController.buscarDraft);
 router.get('/drafts', authMiddleware.verificarToken, postController.listarDrafts);
 
-router.get('/feed', authMiddleware.verificarToken, postController.listarFeed);
+router.get('/feed', authMiddleware.verificarToken, postController.listarFeedGlobal);
+router.get('/feed/cliente', authMiddleware.verificarToken, postController.listarFeedCliente);
+router.post('/posts/:id/republicar', authMiddleware.verificarToken, postController.republicarPost);
 router.get('/posts/:id/status', authMiddleware.verificarToken, postController.consultarStatusPost);
 router.put('/posts/:id/move', authMiddleware.verificarToken, postController.moverPost);
 

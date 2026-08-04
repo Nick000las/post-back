@@ -2,6 +2,7 @@ const postService = require('../services/postService.js');
 const kanbanService = require('../services/kanbanService.js');
 const AppError = require('../errors/AppError.js');
 const { responderComErro } = require('../utils/httpErrorHandler.js');
+const { FEED_STATUS_FILTERS, FEED_DATE_FILTERS, PLATAFORMAS_VALIDAS } = require('../constants/feed.js');
 const fs = require('fs');
 
 class PostController {
@@ -31,6 +32,35 @@ class PostController {
         return {
             page: Number.isInteger(page) && page > 0 ? page : PAGE_PADRAO,
             limit: Number.isInteger(limit) && limit > 0 ? Math.min(limit, LIMITE_MAXIMO) : LIMITE_PADRAO
+        };
+    }
+
+    static #parseFiltrosFeedGlobal (query) {
+        const { status = FEED_STATUS_FILTERS.TODOS, clientId, date } = query;
+
+        if (!Object.values(FEED_STATUS_FILTERS).includes(status)) {
+            throw new AppError('Filtro de status inválido');
+        }
+        if (date !== undefined && !Object.values(FEED_DATE_FILTERS).includes(date)) {
+            throw new AppError('Filtro de data inválido');
+        }
+
+        return { status, clientId, date };
+    }
+
+    static #parseFiltrosFeedCliente (query) {
+        const { clientId, platform, month, year } = query;
+
+        if (!clientId) throw new AppError('clientId é obrigatório');
+        if (platform !== undefined && !PLATAFORMAS_VALIDAS.includes(platform)) {
+            throw new AppError('Rede social inválida');
+        }
+
+        return {
+            clientId,
+            platform,
+            month: month !== undefined ? Number.parseInt(month, 10) : undefined,
+            year: year !== undefined ? Number.parseInt(year, 10) : undefined
         };
     }
 
@@ -309,16 +339,53 @@ class PostController {
         }
     }
 
-    static async listarFeed (req, res) {
+    // Torre de controle: cross-client, escopado ao usuário autenticado (req.user.id). Filtros:
+    // status (Todos/Falhas/Publicados), clientId (isola um client) e date (Hoje/7 dias/Este mês).
+    static async listarFeedGlobal (req, res) {
         try {
             const { page, limit } = PostController.#parsePaginacao(req.query);
-            const { feed, pagination } = await postService.listarFeed(page, limit);
+            const filtros = PostController.#parseFiltrosFeedGlobal(req.query);
+            const { feed, pagination } = await postService.listarFeedGlobal(req.user.id, filtros, page, limit);
 
             return res.status(200).json({ feed, pagination });
         } catch (error) {
             return responderComErro(res, error, {
-                logContext: 'Erro ao listar feed:',
+                logContext: 'Erro ao listar feed global:',
                 mensagemPadrao: 'Não foi possível carregar as postagens da equipe'
+            });
+        }
+    }
+
+    // Vitrine/portfólio de um único client. Filtros: platform (rede social) e month/year (mês
+    // específico, pra montagem de relatório).
+    static async listarFeedCliente (req, res) {
+        try {
+            const { page, limit } = PostController.#parsePaginacao(req.query);
+            const filtros = PostController.#parseFiltrosFeedCliente(req.query);
+            const { feed, pagination } = await postService.listarFeedCliente(req.user.id, filtros, page, limit);
+
+            return res.status(200).json({ feed, pagination });
+        } catch (error) {
+            return responderComErro(res, error, {
+                logContext: 'Erro ao listar feed do cliente:',
+                mensagemPadrao: 'Não foi possível carregar as postagens do cliente'
+            });
+        }
+    }
+
+    // Botão "Republicar" do Feed Global (posts FAILED/PARTIAL). Rota e assinatura já ligadas
+    // ponta a ponta — postService.republicarPost ainda é um stub (ver TODO lá) até a regra de
+    // negócio ser implementada manualmente.
+    static async republicarPost (req, res) {
+        const { id } = req.params;
+        try {
+            const { clientId } = req.body;
+            const resultado = await postService.republicarPost(id, clientId, req.user.id);
+            return res.status(202).json(resultado);
+        } catch (error) {
+            return responderComErro(res, error, {
+                logContext: 'Erro ao republicar post:',
+                mensagemPadrao: 'Erro ao republicar o post'
             });
         }
     }

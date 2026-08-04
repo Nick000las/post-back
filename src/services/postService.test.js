@@ -6,6 +6,7 @@ jest.mock('../adapters/prismaAdapter.js', () => ({
     listarStatusContasDoPost: jest.fn(),
     registrarJobAgendado: jest.fn(),
     buscarPostComStatusContas: jest.fn(),
+    vincularPostConta: jest.fn(),
     buscarPostAgendadoComJobs: jest.fn(),
     reverterAgendamentoParaDraft: jest.fn(),
     excluirPostDefinitivo: jest.fn(),
@@ -21,7 +22,9 @@ jest.mock('../adapters/prismaAdapter.js', () => ({
     // Salto automático de coluna (SCHEDULED -> Agendado, status final -> Finalizado): chamado por
     // #moverParaColunaFixa em todo teste de #enfileirarContas/finalizarStatusSeCompleto.
     buscarColunaPorFixedKey: jest.fn(),
-    moverPostDeColuna: jest.fn()
+    moverPostDeColuna: jest.fn(),
+    listarFeedGlobal: jest.fn(),
+    listarFeedCliente: jest.fn()
 }));
 
 jest.mock('../queues/publishQueue.js', () => ({
@@ -78,7 +81,7 @@ describe('PostService', () => {
 
             await postService.finalizarStatusSeCompleto(1);
 
-            expect(prismaAdapter.atualizarStatusPost).toHaveBeenCalledWith(1, 'PUBLISHED');
+            expect(prismaAdapter.atualizarStatusPost).toHaveBeenCalledWith(1, 'PUBLISHED', { published_at: expect.any(Date) });
         });
 
         test('marca FAILED quando nenhuma conta teve sucesso', async () => {
@@ -88,7 +91,7 @@ describe('PostService', () => {
 
             await postService.finalizarStatusSeCompleto(1);
 
-            expect(prismaAdapter.atualizarStatusPost).toHaveBeenCalledWith(1, 'FAILED');
+            expect(prismaAdapter.atualizarStatusPost).toHaveBeenCalledWith(1, 'FAILED', { published_at: expect.any(Date) });
         });
 
         test('marca PARTIAL quando há mistura de sucesso e falha', async () => {
@@ -99,7 +102,7 @@ describe('PostService', () => {
 
             await postService.finalizarStatusSeCompleto(1);
 
-            expect(prismaAdapter.atualizarStatusPost).toHaveBeenCalledWith(1, 'PARTIAL');
+            expect(prismaAdapter.atualizarStatusPost).toHaveBeenCalledWith(1, 'PARTIAL', { published_at: expect.any(Date) });
         });
 
         test('move o post pra coluna fixa "Finalizado" ao fechar o status', async () => {
@@ -539,6 +542,155 @@ describe('PostService', () => {
 
             expect(prismaAdapter.removerMidiaDraft).toHaveBeenCalledWith(5, CLIENT_ID);
             expect(resultado).toEqual({ id: 5, file_path: null, thumbnail_path: null });
+        });
+    });
+
+    describe('listarFeedGlobal', () => {
+        beforeEach(() => {
+            prismaAdapter.listarFeedGlobal.mockResolvedValue({ posts: [], total: 0 });
+        });
+
+        test('escopa a busca pelo userId autenticado, sem exigir clientId', async () => {
+            await postService.listarFeedGlobal(USER_ID, { status: 'todos' }, 1, 10);
+
+            expect(prismaAdapter.listarFeedGlobal).toHaveBeenCalledWith(expect.objectContaining({
+                userId: USER_ID,
+                clientId: undefined,
+                statusList: ['SCHEDULED', 'PROCESSING', 'PUBLISHED', 'PARTIAL', 'FAILED']
+            }));
+        });
+
+        test('mapeia o filtro "falhas" para FAILED e PARTIAL', async () => {
+            await postService.listarFeedGlobal(USER_ID, { status: 'falhas' }, 1, 10);
+
+            expect(prismaAdapter.listarFeedGlobal).toHaveBeenCalledWith(expect.objectContaining({
+                statusList: ['FAILED', 'PARTIAL']
+            }));
+        });
+
+        test('valida a posse do cliente quando clientId é informado (isolar um client)', async () => {
+            await postService.listarFeedGlobal(USER_ID, { status: 'todos', clientId: CLIENT_ID }, 1, 10);
+
+            expect(prismaAdapter.buscarClientePorId).toHaveBeenCalledWith(CLIENT_ID, USER_ID);
+        });
+
+        test('lança AppError se o clientId informado não pertence ao usuário', async () => {
+            prismaAdapter.buscarClientePorId.mockResolvedValue(null);
+
+            await expect(
+                postService.listarFeedGlobal(USER_ID, { status: 'todos', clientId: CLIENT_ID }, 1, 10)
+            ).rejects.toThrow(AppError);
+        });
+
+        test('retorna a paginação calculada a partir do total', async () => {
+            prismaAdapter.listarFeedGlobal.mockResolvedValue({ posts: [{ id: 1 }], total: 25 });
+
+            const resultado = await postService.listarFeedGlobal(USER_ID, { status: 'todos' }, 2, 10);
+
+            expect(resultado).toEqual({
+                feed: [{ id: 1 }],
+                pagination: { page: 2, limit: 10, total: 25, totalPages: 3 }
+            });
+        });
+    });
+
+    describe('listarFeedCliente', () => {
+        beforeEach(() => {
+            prismaAdapter.listarFeedCliente.mockResolvedValue({ posts: [], total: 0 });
+        });
+
+        test('exige clientId válido (posse do usuário) antes de listar', async () => {
+            await postService.listarFeedCliente(USER_ID, { clientId: CLIENT_ID }, 1, 10);
+
+            expect(prismaAdapter.buscarClientePorId).toHaveBeenCalledWith(CLIENT_ID, USER_ID);
+            expect(prismaAdapter.listarFeedCliente).toHaveBeenCalledWith(expect.objectContaining({ clientId: CLIENT_ID }));
+        });
+
+        test('lança AppError se o cliente não pertence ao usuário', async () => {
+            prismaAdapter.buscarClientePorId.mockResolvedValue(null);
+
+            await expect(
+                postService.listarFeedCliente(USER_ID, { clientId: CLIENT_ID }, 1, 10)
+            ).rejects.toThrow(AppError);
+            expect(prismaAdapter.listarFeedCliente).not.toHaveBeenCalled();
+        });
+
+        test('repassa o filtro de platform pro adapter', async () => {
+            await postService.listarFeedCliente(USER_ID, { clientId: CLIENT_ID, platform: 'instagram' }, 1, 10);
+
+            expect(prismaAdapter.listarFeedCliente).toHaveBeenCalledWith(expect.objectContaining({ platform: 'instagram' }));
+        });
+
+        test('resolve o intervalo de mês/ano só quando os dois vierem', async () => {
+            await postService.listarFeedCliente(USER_ID, { clientId: CLIENT_ID, month: 8, year: 2026 }, 1, 10);
+
+            const chamada = prismaAdapter.listarFeedCliente.mock.calls[0][0];
+            expect(chamada.intervalo).toEqual({
+                from: new Date(2026, 7, 1, 0, 0, 0, 0),
+                to: new Date(2026, 7, 31, 23, 59, 59, 999)
+            });
+        });
+
+        test('filtra o ano inteiro quando só year vier (dropdown "Todos os meses")', async () => {
+            await postService.listarFeedCliente(USER_ID, { clientId: CLIENT_ID, year: 2025 }, 1, 10);
+
+            const chamada = prismaAdapter.listarFeedCliente.mock.calls[0][0];
+            expect(chamada.intervalo).toEqual({
+                from: new Date(2025, 0, 1, 0, 0, 0, 0),
+                to: new Date(2025, 11, 31, 23, 59, 59, 999)
+            });
+        });
+
+        test('não filtra por data se só month vier, sem year', async () => {
+            await postService.listarFeedCliente(USER_ID, { clientId: CLIENT_ID, month: 8 }, 1, 10);
+
+            expect(prismaAdapter.listarFeedCliente).toHaveBeenCalledWith(expect.objectContaining({ intervalo: undefined }));
+        });
+    });
+
+    describe('republicarPost', () => {
+        test('lança AppError se o cliente não pertence ao usuário', async () => {
+            prismaAdapter.buscarClientePorId.mockResolvedValue(null);
+
+            await expect(postService.republicarPost(1, CLIENT_ID, USER_ID)).rejects.toThrow(AppError);
+            expect(prismaAdapter.buscarPostComStatusContas).not.toHaveBeenCalled();
+        });
+
+        test('lança AppError se o post não é encontrado', async () => {
+            prismaAdapter.buscarPostComStatusContas.mockResolvedValue(null);
+
+            await expect(postService.republicarPost(1, CLIENT_ID, USER_ID)).rejects.toThrow(AppError);
+        });
+
+        test('lança AppError se não há contas com falha', async () => {
+            prismaAdapter.buscarPostComStatusContas.mockResolvedValue({
+                id: 1,
+                status: 'PUBLISHED',
+                accounts: [{ accountId: 2, platform: 'instagram', delivery_status: 'SUCCESS', error_message: null }]
+            });
+
+            await expect(postService.republicarPost(1, CLIENT_ID, USER_ID)).rejects.toThrow(AppError);
+            expect(prismaAdapter.vincularPostConta).not.toHaveBeenCalled();
+        });
+
+        test('reseta só as contas com falha pra PENDING e reenfileira só elas', async () => {
+            prismaAdapter.buscarPostComStatusContas.mockResolvedValue({
+                id: 1,
+                status: 'PARTIAL',
+                accounts: [
+                    { accountId: 2, platform: 'instagram', delivery_status: 'FAILED', error_message: 'Token expirado' },
+                    { accountId: 3, platform: 'facebook', delivery_status: 'SUCCESS', error_message: null }
+                ]
+            });
+
+            const resultado = await postService.republicarPost(1, CLIENT_ID, USER_ID);
+
+            expect(prismaAdapter.vincularPostConta).toHaveBeenCalledTimes(1);
+            expect(prismaAdapter.vincularPostConta).toHaveBeenCalledWith(1, 2, 'PENDING', null, null);
+            expect(publishQueue.add).toHaveBeenCalledTimes(1);
+            expect(publishQueue.add).toHaveBeenCalledWith('publicar-conta', { postId: 1, accountId: 2, clientId: CLIENT_ID }, {});
+            expect(prismaAdapter.atualizarStatusPost).toHaveBeenCalledWith(1, 'PROCESSING');
+            expect(resultado).toEqual({ status: 'queued', postId: 1, totalContas: 1 });
         });
     });
 });

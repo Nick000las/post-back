@@ -4,6 +4,7 @@ const { publishQueue } = require('../queues/publishQueue.js');
 const kanbanService = require('./kanbanService.js');
 const thumbnailService = require('./thumbnailService.js');
 const { FIXED_COLUMN_KEYS } = require('../constants/kanban.js');
+const { FEED_STATUS_FILTER_MAP, FEED_DATE_FILTERS } = require('../constants/feed.js');
 const fs = require('fs');
 const path = require('path');
 
@@ -79,6 +80,43 @@ class PostService {
         };
     }
 
+    // Resolve o filtro de data (query param, ex.: 'hoje'/'7dias'/'mes') pro intervalo [from, to] usado
+    // nos where dos feeds. undefined quando não houver filtro (sem corte de data).
+    static #resolverIntervaloData(dateFilter) {
+        if (!dateFilter) return undefined;
+
+        const agora = new Date();
+        const from = new Date(agora);
+
+        switch (dateFilter) {
+            case FEED_DATE_FILTERS.HOJE:
+                from.setHours(0, 0, 0, 0);
+                break;
+            case FEED_DATE_FILTERS.SETE_DIAS:
+                from.setDate(from.getDate() - 7);
+                break;
+            case FEED_DATE_FILTERS.ESTE_MES:
+                from.setDate(1);
+                from.setHours(0, 0, 0, 0);
+                break;
+            default:
+                throw new AppError('Filtro de data inválido');
+        }
+
+        return { from, to: agora };
+    }
+
+    // Resolve mês/ano (query params do Feed do Cliente) pro intervalo [from, to]. year é obrigatório
+    // (sem ele, undefined = sem filtro); month é opcional — se vier, restringe àquele mês, senão
+    // cobre o ano inteiro (caso do dropdown "Todos os meses" + um ano específico).
+    static #resolverIntervaloMesAno(month, year) {
+        if (!year) return undefined;
+
+        const from = month ? new Date(year, month - 1, 1, 0, 0, 0, 0) : new Date(year, 0, 1, 0, 0, 0, 0);
+        const to = month ? new Date(year, month, 0, 23, 59, 59, 999) : new Date(year, 11, 31, 23, 59, 59, 999);
+        return { from, to };
+    }
+
     static async #validarDataFutura(scheduledFor){
         if (typeof scheduledFor !== 'string' || !FORMATO_ISO_COM_FUSO.test(scheduledFor)) {
             throw new AppError('Data de agendamento inválida. Use ISO 8601 com fuso horário explícito (ex.: 2026-08-01T10:00:00-03:00).');
@@ -96,7 +134,7 @@ class PostService {
         const sucessos = contas.filter(conta => conta.delivery_status === 'SUCCESS').length;
         const statusFinal = sucessos === 0 ? 'FAILED' : sucessos === contas.length ? 'PUBLISHED' : 'PARTIAL';
 
-        await prismaAdapter.atualizarStatusPost(postId, statusFinal);
+        await prismaAdapter.atualizarStatusPost(postId, statusFinal, { published_at: new Date() });
 
         // O worker só tem postId/accountId no job.data — precisa buscar o post pra saber o client_id
         // antes de conseguir resolver a coluna Finalizado desse client.
@@ -364,18 +402,75 @@ class PostService {
         return draft;
     }
 
-    static async listarFeed (page, limit) {
-        const { posts, total } = await prismaAdapter.listarFeed(page, limit);
+    // Feed Global ("torre de controle"): cross-client, escopado ao usuário autenticado. filtros:
+    // { status, clientId?, date? } — status já validado/default no controller (#parseFiltrosFeedGlobal).
+    static async listarFeedGlobal (userId, filtros, page, limit) {
+        if (filtros.clientId) await this.#validarCliente(filtros.clientId, userId);
+
+        const statusList = FEED_STATUS_FILTER_MAP[filtros.status];
+        const intervalo = this.#resolverIntervaloData(filtros.date);
+
+        const { posts, total } = await prismaAdapter.listarFeedGlobal({
+            userId,
+            clientId: filtros.clientId,
+            statusList,
+            intervalo,
+            page,
+            limit
+        });
 
         return {
             feed: posts,
-            pagination: {
-                page,
-                limit,
-                total,
-                totalPages: Math.ceil(total / limit)
-            }
+            pagination: { page, limit, total, totalPages: Math.ceil(total / limit) }
         };
+    }
+
+    // Feed do Cliente ("vitrine/portfólio"): sempre de um único client. filtros:
+    // { clientId, platform?, month?, year? } — clientId é obrigatório (garantido no controller).
+    static async listarFeedCliente (userId, filtros, page, limit) {
+        await this.#validarCliente(filtros.clientId, userId);
+
+        const intervalo = this.#resolverIntervaloMesAno(filtros.month, filtros.year);
+
+        const { posts, total } = await prismaAdapter.listarFeedCliente({
+            clientId: filtros.clientId,
+            platform: filtros.platform,
+            intervalo,
+            page,
+            limit
+        });
+
+        return {
+            feed: posts,
+            pagination: { page, limit, total, totalPages: Math.ceil(total / limit) }
+        };
+    }
+
+    // TODO (implementação manual): decidir e implementar a regra de republicação do botão
+    // "Republicar" do Feed Global, disparado sobre posts FAILED/PARTIAL.
+    // Sugestão de esqueleto do fluxo:
+    //   1. localizar post + post_accounts com delivery_status FAILED (novo método no adapter);
+    //   2. decidir escopo: só as contas FAILED, ou o post inteiro volta a PROCESSING?
+    //   3. resetar delivery_status/error_message pra PENDING nas contas relevantes;
+    //   4. reaproveitar o padrão de #enfileirarContas (publishQueue.add) pra re-enfileirar.
+    static async republicarPost (postId, clientId, userId) {
+        await this.#validarCliente(clientId, userId);
+
+        const post = await prismaAdapter.buscarPostComStatusContas(postId, clientId);
+        if (!post) throw new AppError('Post não encontrado');
+
+        const contasFailed = post.accounts.filter(account => account.delivery_status === 'FAILED');
+        if (contasFailed.length === 0) throw new AppError('Não há contas com falha para republicar');
+
+        await Promise.all(contasFailed.map(account =>
+            prismaAdapter.vincularPostConta(postId, account.accountId, 'PENDING', null, null)
+        ));
+
+        return this.#enfileirarContas(
+            post,
+            contasFailed.map(account => ({ id: account.accountId })),
+            clientId
+        );
     }
 }
 

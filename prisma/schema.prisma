@@ -10,14 +10,17 @@ datasource db {
 // TODO (agência/CRM): agência = users; cada users pode ter vários clients; accounts/posts passam
 // a pertencer a um client, não mais diretamente a um user.
 model clients {
-  id         Int        @id @default(autoincrement())
-  name       String     @db.VarChar(100)
-  user_id    Int
-  created_at DateTime?  @default(now()) @db.Timestamptz(6)
-  users      users      @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_client_user")
-  accounts   accounts[]
-  posts      posts[]
-  columns    columns[]
+  id          Int        @id @default(autoincrement())
+  name        String     @db.VarChar(100)
+  // Caminho (relativo a .uploads/) do avatar/logo do client, exibido no card do Feed Global —
+  // mesmo padrão de posts.thumbnail_path. Nullable: nenhum endpoint de upload existe ainda.
+  avatar_path String?    @db.VarChar(255)
+  user_id     Int
+  created_at  DateTime?  @default(now()) @db.Timestamptz(6)
+  users       users      @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_client_user")
+  accounts    accounts[]
+  posts       posts[]
+  columns     columns[]
 }
 
 model accounts {
@@ -64,6 +67,11 @@ model posts {
   status         String          @default("DRAFT") @db.VarChar(20)
   // TODO (agendamento): horário alvo da publicação, em UTC. Preencher só quando status = 'SCHEDULED'.
   scheduled_for  DateTime?       @db.Timestamptz(6)
+  // Setado uma única vez em postService#finalizarStatusSeCompleto, quando o post fecha como
+  // PUBLISHED/PARTIAL/FAILED. Ao contrário de updated_at (que qualquer edição futura altera), é a
+  // fonte confiável de "quando foi publicado de fato" — usado pelo filtro de mês/ano do Feed do
+  // Cliente. Nullable: posts anteriores a essa feature (e drafts/scheduled) não têm.
+  published_at   DateTime?       @db.Timestamptz(6)
   client_id      Int
   // Kanban: coluna atual do post no quadro do client. Nullable só por segurança de migração — toda
   // criação/movimentação de post no código é responsável por manter isso preenchido (ver
