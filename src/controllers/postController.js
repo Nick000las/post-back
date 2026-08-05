@@ -389,6 +389,22 @@ class PostController {
             });
         }
     }
+
+    // Vincula/edita as contas de um draft já existente (ex.: um draft importado pelo Lab de IA,
+    // que nasce sem nenhuma conta). Substitui todo o conjunto de contas vinculadas pelo enviado.
+    static async vincularContasAoDraft (req, res) {
+        const { id } = req.params;
+        try {
+            const { clientId, accountIds } = req.body;
+            const resultado = await postService.vincularContasAoDraft(id, clientId, req.user.id, accountIds);
+            return res.status(200).json(resultado);
+        } catch (error) {
+            return responderComErro(res, error, {
+                logContext: 'Erro ao vincular contas ao draft:',
+                mensagemPadrao: 'Erro ao vincular contas ao draft'
+            });
+        }
+    }
 }
 
 module.exports = PostController;

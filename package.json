@@ -22,6 +22,7 @@
     "jsonwebtoken": "^9.0.3",
     "morgan": "^1.11.0",
     "multer": "^2.2.0",
+    "pdf-parse": "^2.4.5",
     "sharp": "^0.35.3"
   },
   "keywords": [],

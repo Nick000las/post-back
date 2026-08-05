@@ -32,7 +32,9 @@ const POST_SELECT_BASE = {
     status: true,
     created_at: true,
     updated_at: true,
-    published_at: true
+    published_at: true,
+    suggested_date: true,
+    format: true
 };
 
 // Conjunto de status que aparece nos dois feeds — exclui DRAFT (rascunho ainda não é "conteúdo
@@ -288,7 +290,7 @@ class PrismaAdapter {
     // pra gravar published_at junto com o status final, numa única query).
     static async atualizarStatusPost(postId, status, extra = {}) {
         return await prisma.posts.update({
-            where: { id: postId },
+            where: { id: parseInt(postId) },
             data: { status, updated_at: new Date(), ...extra }
         });
     }
@@ -537,6 +539,30 @@ class PrismaAdapter {
         return vinculos.map(vinculo => ({ id: vinculo.account_id }));
     }
 
+    static async substituirContasDoDraft(draftId, clientId, accountIds) {
+        return await prisma.$transaction(async (tx) => {
+            await tx.post_accounts.deleteMany({
+                where: { post_id: parseInt(draftId), posts: { client_id: parseInt(clientId) } }
+            });
+
+            if (accountIds.length > 0) {
+                await tx.post_accounts.createMany({
+                    data: accountIds.map(accountId => ({
+                        post_id: parseInt(draftId),
+                        account_id: accountId,
+                        delivery_status: 'PENDING'
+                    }))
+                });
+            }
+
+            const vinculos = await tx.post_accounts.findMany({
+                where: { post_id: parseInt(draftId) },
+                select: { accounts: { select: CONTA_SELECT_SEGURO } }
+            });
+            return vinculos.map(vinculo => vinculo.accounts);
+        });
+    }
+
     static async excluirDraft(draftId, clientId) {
         const draft = await prisma.posts.findFirst({
             where: { id: parseInt(draftId), client_id: parseInt(clientId), status: 'DRAFT' },
@@ -720,6 +746,20 @@ class PrismaAdapter {
             posts: posts.map(post => PrismaAdapter.#formatarPostDoFeed(post, { incluirAutor: false })),
             total
         };
+    }
+
+    static async criarPostsEmLotePorIA (clientId, columnId, posts) {
+        return await prisma.posts.createManyAndReturn({
+            data: posts.map(post => ({
+                caption: post.caption ?? null,
+                format: post.format ?? null,
+                suggested_date: post.suggestedDate ? new Date(post.suggestedDate) : null,
+                status: 'DRAFT',
+                client_id: parseInt(clientId),
+                column_id: columnId
+            })),
+            select: POST_SELECT_BASE
+        });
     }
 }
 

@@ -472,6 +472,30 @@ class PostService {
             clientId
         );
     }
+
+    // buscarDraftPorId já filtra status: 'DRAFT' — se achou o post, ele é DRAFT por definição, não
+    // precisa reconferir. Substitui TODAS as contas vinculadas pelo conjunto novo enviado (não
+    // soma às existentes) — decisão consistente com o formulário de seleção de contas ser um
+    // multi-select que reflete o estado final desejado, igual a qualquer outro formulário de edição.
+    static async vincularContasAoDraft (draftId, clientId, userId, accountIds) {
+        await this.#validarCliente(clientId, userId);
+
+        const draft = await prismaAdapter.buscarDraftPorId(draftId, clientId);
+        if (!draft) throw new AppError('Draft não encontrado');
+
+        if (!Array.isArray(accountIds) || accountIds.length === 0) {
+            throw new AppError('Selecione ao menos uma conta');
+        }
+
+        await Promise.all(accountIds.map(async accountId => {
+            const conta = await prismaAdapter.buscarContaPorId(accountId, clientId);
+            if (!conta) throw new AppError(`Conta ${accountId} não pertence ao cliente ${clientId}`);
+        }));
+
+        const accounts = await prismaAdapter.substituirContasDoDraft(draftId, clientId, accountIds);
+
+        return { message: 'Contas vinculadas com sucesso', draftId, accounts };
+    }
 }
 
 module.exports = PostService;

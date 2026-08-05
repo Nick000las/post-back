@@ -45,6 +45,7 @@ router.post('/draft/:id/publish', authMiddleware.verificarToken, postController.
 router.post('/draft/:id/schedule', authMiddleware.verificarToken, postController.agendarDraft);
 router.put('/draft/:id', authMiddleware.verificarToken, postController.atualizarDraft);
 router.put('/draft/:id/media', authMiddleware.verificarToken, uploadMidia.single('arquivo'), postController.atualizarMidiaDraft);
+router.put('/draft/:id/accounts', authMiddleware.verificarToken, postController.vincularContasAoDraft);
 router.delete('/draft/:id/media', authMiddleware.verificarToken, postController.removerMidiaDraft);
 router.delete('/draft/:id', authMiddleware.verificarToken, postController.excluirDraft);
 router.get('/draft/:id', authMiddleware.verificarToken, postController.buscarDraft);

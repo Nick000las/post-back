@@ -72,6 +72,16 @@ model posts {
   // fonte confiável de "quando foi publicado de fato" — usado pelo filtro de mês/ano do Feed do
   // Cliente. Nullable: posts anteriores a essa feature (e drafts/scheduled) não têm.
   published_at   DateTime?       @db.Timestamptz(6)
+  // Preenchido só pela importação do Lab de IA — NUNCA lido pelo motor de publicação (só
+  // scheduled_for aciona a fila/kanban "Agendado"). Puramente informativo: o frontend usa isso pra
+  // pré-selecionar a data no datepicker do modal de "Agendar", sem travar o post como agendado de
+  // verdade até o usuário confirmar.
+  suggested_date DateTime?       @db.Timestamptz(6)
+  // Formato extraído do PDF pela IA: 'FEED' (imagem única ou carrossel — a distinção é decidida
+  // depois pela quantidade de arquivos anexados, não pela IA), 'STORY' ou 'REELS'. Sem enum
+  // reforçado no schema ainda — mesmo padrão informal de status/platform hoje (string livre
+  // validada em código, ver FORMATOS_VALIDOS em src/constants/aiLab.js).
+  format         String?         @db.VarChar(20)
   client_id      Int
   // Kanban: coluna atual do post no quadro do client. Nullable só por segurança de migração — toda
   // criação/movimentação de post no código é responsável por manter isso preenchido (ver

@@ -16,6 +16,8 @@ jest.mock('../adapters/prismaAdapter.js', () => ({
     removerMidiaDraft: jest.fn(),
     buscarPostPorId: jest.fn(),
     listarContasDoDraft: jest.fn(),
+    buscarContaPorId: jest.fn(),
+    substituirContasDoDraft: jest.fn(),
     // Kanban: buscarColunaIdeias é chamado por baixo dos panos (via kanbanService.resolverColunaIdeias)
     // sempre que um post é criado sem columnId explícito — ou seja, em todo teste de criação de post.
     buscarColunaIdeias: jest.fn(),
@@ -691,6 +693,52 @@ describe('PostService', () => {
             expect(publishQueue.add).toHaveBeenCalledWith('publicar-conta', { postId: 1, accountId: 2, clientId: CLIENT_ID }, {});
             expect(prismaAdapter.atualizarStatusPost).toHaveBeenCalledWith(1, 'PROCESSING');
             expect(resultado).toEqual({ status: 'queued', postId: 1, totalContas: 1 });
+        });
+    });
+
+    describe('vincularContasAoDraft', () => {
+        beforeEach(() => {
+            prismaAdapter.buscarDraftPorId.mockResolvedValue({ id: 1, status: 'DRAFT' });
+            prismaAdapter.buscarContaPorId.mockResolvedValue({ id: 2 });
+            prismaAdapter.substituirContasDoDraft.mockResolvedValue([{ id: 2, platform: 'instagram' }]);
+        });
+
+        test('lança AppError se o cliente não pertence ao usuário', async () => {
+            prismaAdapter.buscarClientePorId.mockResolvedValue(null);
+
+            await expect(postService.vincularContasAoDraft(1, CLIENT_ID, USER_ID, [2])).rejects.toThrow(AppError);
+            expect(prismaAdapter.substituirContasDoDraft).not.toHaveBeenCalled();
+        });
+
+        test('lança AppError se o draft não é encontrado', async () => {
+            prismaAdapter.buscarDraftPorId.mockResolvedValue(null);
+
+            await expect(postService.vincularContasAoDraft(1, CLIENT_ID, USER_ID, [2])).rejects.toThrow(AppError);
+        });
+
+        test('lança AppError se accountIds estiver vazio ou não for array', async () => {
+            await expect(postService.vincularContasAoDraft(1, CLIENT_ID, USER_ID, [])).rejects.toThrow(AppError);
+            await expect(postService.vincularContasAoDraft(1, CLIENT_ID, USER_ID, null)).rejects.toThrow(AppError);
+            expect(prismaAdapter.substituirContasDoDraft).not.toHaveBeenCalled();
+        });
+
+        test('lança AppError se alguma conta não pertence ao cliente', async () => {
+            prismaAdapter.buscarContaPorId.mockResolvedValueOnce({ id: 2 }).mockResolvedValueOnce(null);
+
+            await expect(postService.vincularContasAoDraft(1, CLIENT_ID, USER_ID, [2, 3])).rejects.toThrow(AppError);
+            expect(prismaAdapter.substituirContasDoDraft).not.toHaveBeenCalled();
+        });
+
+        test('substitui as contas do draft uma única vez com o conjunto completo', async () => {
+            const resultado = await postService.vincularContasAoDraft(1, CLIENT_ID, USER_ID, [2, 3]);
+
+            expect(prismaAdapter.substituirContasDoDraft).toHaveBeenCalledTimes(1);
+            expect(prismaAdapter.substituirContasDoDraft).toHaveBeenCalledWith(1, CLIENT_ID, [2, 3]);
+            expect(resultado).toEqual({
+                message: 'Contas vinculadas com sucesso',
+                draftId: 1,
+                accounts: [{ id: 2, platform: 'instagram' }]
+            });
         });
     });
 });
