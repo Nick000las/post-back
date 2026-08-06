@@ -29,7 +29,7 @@ class PostService {
 
     // Gancho de IA (Kanban): todo post criado passa por aqui pra decidir sua column_id. Se
     // columnIdExplicito vier definido (futura rota de IA que já escolhe a coluna), usa ele; senão,
-    // cai por padrão na coluna "Ideias" do client. Este é o ÚNICO lugar que decide esse default —
+    // cai por padrão na coluna "Rascunhos" do client. Este é o ÚNICO lugar que decide esse default —
     // gerenciarPostagemEmLote/agendarPostagem/criarDraft chamam este método antes de criar o post.
     static async #resolverColumnId (clientId, columnIdExplicito) {
         if (columnIdExplicito !== undefined && columnIdExplicito !== null) {
@@ -194,7 +194,7 @@ class PostService {
     }
 
     // Cancelar agendamento NÃO apaga o post — reverte pra DRAFT (arte/legenda preservadas) e move o
-    // card de volta pra coluna Ideias, pra a agência poder reeditar/reagendar depois sem reupload.
+    // card de volta pra coluna Rascunhos, pra a agência poder reeditar/reagendar depois sem reupload.
     static async cancelarAgendamento (postId, clientId, userId) {
         await this.#validarCliente(clientId, userId);
 
@@ -276,8 +276,10 @@ class PostService {
         const post = await prismaAdapter.excluirPostDefinitivo(postId, clientId);
         if (!post) throw new AppError('Post não encontrado');
 
-        // file_path pode ser null (post sem mídia — removida no editor do Kanban antes da exclusão).
+        // file_path/thumbnail_path podem ser null (post sem mídia — removida no editor do Kanban
+        // antes da exclusão).
         if (post.file_path) this.#removerArquivoLocal({ path: path.join(UPLOADS_DIR, post.file_path) });
+        if (post.thumbnail_path) this.#removerArquivoLocal({ path: path.join(UPLOADS_DIR, 'thumbs', post.thumbnail_path) });
 
         return { message: 'Post excluído com sucesso', postId };
     }
@@ -308,7 +310,7 @@ class PostService {
     }
 
     // Análogo de publicarDraft, mas agendando em vez de publicar imediatamente. Existe pra permitir
-    // agendar um post que já está no Kanban (ex.: card em "Ideias") sem duplicar o post nem reenviar o
+    // agendar um post que já está no Kanban (ex.: card em "Rascunhos") sem duplicar o post nem reenviar o
     // arquivo — ao contrário de agendarPostagem (multipart, sempre cria um post novo).
     static async agendarDraft (draftId, clientId, userId, scheduledFor) {
         await this.#validarCliente(clientId, userId);
@@ -397,8 +399,10 @@ class PostService {
         const draft = await prismaAdapter.excluirDraft(draftId, clientId);
         if (!draft) throw new AppError('Draft não encontrado');
 
-        // file_path pode ser null (draft sem mídia — removida no editor do Kanban antes da exclusão).
+        // file_path/thumbnail_path podem ser null (draft sem mídia — removida no editor do Kanban
+        // antes da exclusão).
         if (draft.file_path) this.#removerArquivoLocal({ path: path.join(UPLOADS_DIR, draft.file_path) });
+        if (draft.thumbnail_path) this.#removerArquivoLocal({ path: path.join(UPLOADS_DIR, 'thumbs', draft.thumbnail_path) });
         return draft;
     }
 

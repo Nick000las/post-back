@@ -148,7 +148,7 @@ describe('AiLabService', () => {
             await expect(aiLabService.importarPostsExtraidos([], CLIENT_ID, USER_ID)).rejects.toThrow(AppError);
         });
 
-        test('resolve a coluna Ideias e cria os posts em lote nela', async () => {
+        test('resolve a coluna Rascunhos e cria os posts em lote nela', async () => {
             prismaAdapter.criarPostsEmLotePorIA.mockResolvedValue(posts.map((post, i) => ({ id: i + 1, ...post })));
 
             const resultado = await aiLabService.importarPostsExtraidos(posts, CLIENT_ID, USER_ID);

@@ -235,7 +235,7 @@ class PostController {
 
     // Agenda um draft/post existente sem duplicá-lo nem reenviar arquivo — diferente de
     // agendarPostagem (multipart, sempre cria um post novo). Usado pelo Kanban pra agendar um card
-    // que já existe no quadro (ex.: em "Ideias").
+    // que já existe no quadro (ex.: em "Rascunhos").
     static async agendarDraft (req, res) {
         const { id } = req.params;
         try {

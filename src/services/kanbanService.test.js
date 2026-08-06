@@ -32,7 +32,7 @@ describe('KanbanService', () => {
         });
 
         test('retorna { columns } com o resultado do adapter', async () => {
-            const columns = [{ id: 1, name: 'Ideias', posts: [] }];
+            const columns = [{ id: 1, name: 'Rascunhos', posts: [] }];
             prismaAdapter.buscarQuadro.mockResolvedValue(columns);
 
             const resultado = await kanbanService.listarQuadro(CLIENT_ID, USER_ID);
@@ -135,7 +135,7 @@ describe('KanbanService', () => {
             await expect(kanbanService.moverPost(1, CLIENT_ID, USER_ID, 3)).rejects.toThrow(AppError);
         });
 
-        test('move o post para uma coluna dinâmica ou para Ideias', async () => {
+        test('move o post para uma coluna dinâmica ou para Rascunhos', async () => {
             prismaAdapter.buscarColunaPorId.mockResolvedValue({ id: 3, fixed_key: null, is_fixed: false });
             prismaAdapter.moverPostDeColuna.mockResolvedValue({ id: 1, column_id: 3 });
 
@@ -147,13 +147,13 @@ describe('KanbanService', () => {
     });
 
     describe('resolverColunaIdeias', () => {
-        test('lança erro se o client não tiver coluna Ideias (inconsistência de dados)', async () => {
+        test('lança erro se o client não tiver coluna Rascunhos (inconsistência de dados)', async () => {
             prismaAdapter.buscarColunaIdeias.mockResolvedValue(null);
 
             await expect(kanbanService.resolverColunaIdeias(CLIENT_ID)).rejects.toThrow(AppError);
         });
 
-        test('retorna o id da coluna Ideias do client', async () => {
+        test('retorna o id da coluna Rascunhos do client', async () => {
             prismaAdapter.buscarColunaIdeias.mockResolvedValue({ id: 1001 });
 
             const id = await kanbanService.resolverColunaIdeias(CLIENT_ID);

@@ -132,7 +132,7 @@ class PrismaAdapter {
         });
     }
 
-    // Genérico: busca qualquer uma das 3 colunas fixas (Ideias/Agendado/Finalizado) do client. Usado
+    // Genérico: busca qualquer uma das 3 colunas fixas (Rascunhos/Agendado/Finalizado) do client. Usado
     // pelo salto automático de coluna quando um post muda de status (ver postService#moverParaColunaFixa).
     static async buscarColunaPorFixedKey(clientId, fixedKey) {
         return await prisma.columns.findFirst({
@@ -182,7 +182,7 @@ class PrismaAdapter {
                 where: { client_id: parseInt(clientId), fixed_key: FIXED_COLUMN_KEYS.IDEIAS },
                 select: { id: true }
             });
-            if (!colunaIdeias) throw new Error(`Client ${clientId} sem coluna Ideias — inconsistência de dados`);
+            if (!colunaIdeias) throw new Error(`Client ${clientId} sem coluna Rascunhos — inconsistência de dados`);
 
             const { count: postsMovidos } = await tx.posts.updateMany({
                 where: { client_id: parseInt(clientId), column_id: parseInt(id) },
@@ -502,7 +502,7 @@ class PrismaAdapter {
     static async excluirPostDefinitivo(postId, clientId) {
         const post = await prisma.posts.findFirst({
             where: { id: parseInt(postId), client_id: parseInt(clientId) },
-            select: { id: true, file_path: true }
+            select: { id: true, file_path: true, thumbnail_path: true }
         });
         if (!post) return null;
 

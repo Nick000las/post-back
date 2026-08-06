@@ -116,7 +116,7 @@ class AiLabService {
     }
 
     // Importação: recebe a lista já revisada/editada pelo usuário no frontend e persiste em lote
-    // como cards DRAFT vazios (sem mídia, sem contas) na coluna Ideias do client.
+    // como cards DRAFT vazios (sem mídia, sem contas) na coluna Rascunhos do client.
     static async importarPostsExtraidos (posts, clientId, userId) {
         await this.#validarCliente(clientId, userId);
 

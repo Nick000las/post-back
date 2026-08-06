@@ -18,6 +18,7 @@ jest.mock('../adapters/prismaAdapter.js', () => ({
     listarContasDoDraft: jest.fn(),
     buscarContaPorId: jest.fn(),
     substituirContasDoDraft: jest.fn(),
+    excluirDraft: jest.fn(),
     // Kanban: buscarColunaIdeias é chamado por baixo dos panos (via kanbanService.resolverColunaIdeias)
     // sempre que um post é criado sem columnId explícito — ou seja, em todo teste de criação de post.
     buscarColunaIdeias: jest.fn(),
@@ -42,6 +43,8 @@ jest.mock('fs', () => ({
     unlinkSync: jest.fn()
 }));
 
+const fs = require('fs');
+const path = require('path');
 const prismaAdapter = require('../adapters/prismaAdapter.js');
 const { publishQueue } = require('../queues/publishQueue.js');
 const thumbnailService = require('./thumbnailService.js');
@@ -60,6 +63,9 @@ describe('PostService', () => {
         prismaAdapter.buscarColunaPorFixedKey.mockResolvedValue({ id: 2002 });
         thumbnailService.gerar.mockResolvedValue(null);
         publishQueue.add.mockResolvedValue({ id: 'job-1' });
+        // jest.clearAllMocks() (no afterEach) limpa chamadas, mas não desfaz mockReturnValue —
+        // sem isso, um teste que liga existsSync pra true vazaria esse valor pros seguintes.
+        fs.existsSync.mockReturnValue(false);
     });
     afterEach(() => jest.clearAllMocks());
 
@@ -273,7 +279,7 @@ describe('PostService', () => {
             expect(prismaAdapter.reverterAgendamentoParaDraft).not.toHaveBeenCalled();
         });
 
-        test('remove apenas os jobs em estado delayed, reverte o post pra DRAFT e move pra Ideias', async () => {
+        test('remove apenas os jobs em estado delayed, reverte o post pra DRAFT e move pra Rascunhos', async () => {
             prismaAdapter.buscarPostAgendadoComJobs.mockResolvedValue({
                 id: 8,
                 file_path: 'foo.jpg',
@@ -374,6 +380,27 @@ describe('PostService', () => {
 
             expect(publishQueue.getJob).not.toHaveBeenCalled();
             expect(resultado).toEqual({ message: 'Post excluído com sucesso', postId: 3 });
+        });
+
+        test('remove o arquivo original e o thumbnail do disco quando existirem', async () => {
+            prismaAdapter.buscarPostAgendadoComJobs.mockResolvedValue(null);
+            prismaAdapter.excluirPostDefinitivo.mockResolvedValue({ id: 3, file_path: 'bar.jpg', thumbnail_path: 'bar-thumb.jpg' });
+            fs.existsSync.mockReturnValue(true);
+
+            await postService.excluirPost(3, CLIENT_ID, USER_ID);
+
+            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join('.uploads', 'bar.jpg'));
+            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join('.uploads', 'thumbs', 'bar-thumb.jpg'));
+        });
+
+        test('não tenta remover thumbnail quando o post não tem um (mídia já havia sido removida)', async () => {
+            prismaAdapter.buscarPostAgendadoComJobs.mockResolvedValue(null);
+            prismaAdapter.excluirPostDefinitivo.mockResolvedValue({ id: 3, file_path: null, thumbnail_path: null });
+            fs.existsSync.mockReturnValue(true);
+
+            await postService.excluirPost(3, CLIENT_ID, USER_ID);
+
+            expect(fs.unlinkSync).not.toHaveBeenCalled();
         });
     });
 
@@ -544,6 +571,33 @@ describe('PostService', () => {
 
             expect(prismaAdapter.removerMidiaDraft).toHaveBeenCalledWith(5, CLIENT_ID);
             expect(resultado).toEqual({ id: 5, file_path: null, thumbnail_path: null });
+        });
+    });
+
+    describe('excluirDraft', () => {
+        test('lança AppError se o draft não existe/não pertence ao cliente', async () => {
+            prismaAdapter.excluirDraft.mockResolvedValue(null);
+
+            await expect(postService.excluirDraft(1, CLIENT_ID, USER_ID)).rejects.toThrow(AppError);
+        });
+
+        test('remove o arquivo original e o thumbnail do disco quando existirem', async () => {
+            prismaAdapter.excluirDraft.mockResolvedValue({ id: 5, file_path: 'antigo.jpg', thumbnail_path: 'antigo-thumb.jpg' });
+            fs.existsSync.mockReturnValue(true);
+
+            await postService.excluirDraft(5, CLIENT_ID, USER_ID);
+
+            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join('.uploads', 'antigo.jpg'));
+            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join('.uploads', 'thumbs', 'antigo-thumb.jpg'));
+        });
+
+        test('não tenta remover arquivos quando o draft não tem mídia', async () => {
+            prismaAdapter.excluirDraft.mockResolvedValue({ id: 5, file_path: null, thumbnail_path: null });
+            fs.existsSync.mockReturnValue(true);
+
+            await postService.excluirDraft(5, CLIENT_ID, USER_ID);
+
+            expect(fs.unlinkSync).not.toHaveBeenCalled();
         });
     });
 

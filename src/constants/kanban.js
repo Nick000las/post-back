@@ -1,7 +1,15 @@
+// ATENÇÃO ao descasamento proposital da primeira coluna: o `name` exibido é "Rascunhos", mas o
+// `fixed_key` continua 'IDEIAS'. O fixed_key é um discriminador interno — está gravado em
+// columns.fixed_key de todos os clients existentes, no índice uq_column_client_fixed_key e no
+// backfill da migration 20260729174226. Renomeá-lo exigiria migration de dados acoplada ao deploy
+// do código (se a migration rodasse antes, buscarColunaIdeias não acharia nada e TODA criação de
+// post quebraria). O usuário nunca vê o fixed_key, então o custo de mantê-lo é só cosmético: os
+// símbolos internos (FIXED_COLUMN_KEYS.IDEIAS, resolverColunaIdeias, buscarColunaIdeias) seguem
+// dizendo "Ideias" enquanto a UI diz "Rascunhos". NÃO "conserte" isso sem migration.
 const FIXED_COLUMN_KEYS = { IDEIAS: 'IDEIAS', AGENDADO: 'AGENDADO', FINALIZADO: 'FINALIZADO' };
 
 const FIXED_COLUMNS_SEED = [
-    { name: 'Ideias', fixed_key: FIXED_COLUMN_KEYS.IDEIAS, order: 1000 },
+    { name: 'Rascunhos', fixed_key: FIXED_COLUMN_KEYS.IDEIAS, order: 1000 },
     { name: 'Agendado', fixed_key: FIXED_COLUMN_KEYS.AGENDADO, order: 2000 },
     { name: 'Finalizado', fixed_key: FIXED_COLUMN_KEYS.FINALIZADO, order: 3000 }
 ];

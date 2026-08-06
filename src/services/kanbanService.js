@@ -51,7 +51,7 @@ class KanbanService {
         if (!coluna) throw new AppError('Coluna não encontrada');
         if (coluna.is_fixed) throw new AppError('Não é possível excluir uma coluna fixa');
 
-        // excluirColunaDinamica já reatribui os posts da coluna excluída pra Ideias antes de apagar.
+        // excluirColunaDinamica já reatribui os posts da coluna excluída pra Rascunhos antes de apagar.
         return prismaAdapter.excluirColunaDinamica(id, clientId);
     }
 
@@ -72,11 +72,11 @@ class KanbanService {
         return post;
     }
 
-    // Gancho de IA: ponto de resolução reutilizável da coluna "Ideias" de um client — chamado por
+    // Gancho de IA: ponto de resolução reutilizável da coluna "Rascunhos" de um client — chamado por
     // postService#resolverColumnId sempre que um post é criado sem column_id explícito.
     static async resolverColunaIdeias (clientId) {
         const coluna = await prismaAdapter.buscarColunaIdeias(clientId);
-        if (!coluna) throw new AppError('Coluna Ideias não encontrada para este cliente');
+        if (!coluna) throw new AppError('Coluna Rascunhos não encontrada para este cliente');
         return coluna.id;
     }
 }
