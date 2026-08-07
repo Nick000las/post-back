@@ -45,7 +45,7 @@ describe('MetaAdapter — carrossel', () => {
             const post = { caption: 'c', media: [imagem('a'), video('b')] };
 
             await expect(metaAdapter.publicarNoFacebook(post, TOKEN, PAGE_ID))
-                .rejects.toThrow('Carrossel do Facebook não suporta vídeos nessa integração.');
+                .rejects.toThrow('Carrossel do Facebook não suporta vídeos.');
             expect(global.fetch).not.toHaveBeenCalled();
         });
     });

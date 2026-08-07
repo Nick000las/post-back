@@ -13,10 +13,8 @@ class LinkedinAdapter {
             throw new AppError('URN do Linkedin inválido ou ausente.');
         }
 
-        // Rejeita carrossel explicitamente: sem isso, os itens extras seriam ignorados em silêncio
-        // e o usuário publicaria só o primeiro achando que publicou todos.
         if (post.media.length > 1) {
-            throw new AppError('O Linkedin não suporta carrossel nessa integração.');
+            return this.#publicarCarrosselFotos(post, accessToken, authorUrn);
         }
 
         const [midia] = post.media;
@@ -25,6 +23,46 @@ class LinkedinAdapter {
         }
 
         return this.#publicarComMedia(post, midia, accessToken, authorUrn);
+    }
+
+    // Carrossel do Linkedin: a UGC API aceita múltiplas imagens no MESMO post (array `media` com
+    // 2+ entradas, cada uma com seu próprio asset registrado), mas não existe carrossel de vídeo.
+    // Só é chamado com 2+ itens (garantido por publicarContainer).
+    static async #publicarCarrosselFotos (post, accessToken, authorUrn) {
+        if (post.media.some(midia => midia.file_type.startsWith('video/'))) {
+            throw new AppError('O Linkedin não suporta carrossel com vídeo.');
+        }
+
+        // Promise.all preserva a ordem do array de ENTRADA no resultado — garante que o carrossel
+        // saia na mesma ordem em que o usuário subiu os arquivos, mesmo que os uploads (rede)
+        // terminem fora de ordem (mesma garantia já usada no carrossel da Meta, ver metaAdapter.js).
+        const itensCarrossel = await Promise.all(post.media.map(async midia => {
+            const { uploadUrl, assetUrn } = await this.#registrarUploadMidia(authorUrn, accessToken, midia.file_type);
+            await this.#enviarArquivoBinario(midia.file_path, uploadUrl, accessToken);
+
+            return { assetUrn, fileName: midia.file_name };
+        }));
+
+        const body = {
+            author: authorUrn,
+            lifecycleState: 'PUBLISHED',
+            specificContent: {
+                'com.linkedin.ugc.ShareContent': {
+                    shareCommentary: { text: post.caption },
+                    shareMediaCategory: 'IMAGE',
+                    media: itensCarrossel.map(({ assetUrn, fileName }) => ({
+                        status: 'READY',
+                        description: { text: fileName },
+                        media: assetUrn,
+                        title: { text: fileName }
+                    }))
+                }
+            },
+            visibility: VISIBILITY_PUBLIC
+        };
+
+        const data = await this.#postUgc(body, accessToken, 'Erro ao criar post de carrossel de fotos no Linkedin');
+        return { success: true, externalId: data.id };
     }
 
     static async #publicarTexto (texto, accessToken, authorUrn) {

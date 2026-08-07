@@ -91,7 +91,7 @@ class MetaAdapter {
         // attached_media só aceita foto — vídeo em carrossel não existe nessa API. Melhor um erro
         // claro aqui do que deixar a Meta devolver algo genérico depois de já ter subido arquivos.
         if (post.media.some(midia => midia.file_type.startsWith('video/'))) {
-            throw new AppError('Carrossel do Facebook não suporta vídeos nessa integração.');
+            throw new AppError('Carrossel do Facebook não suporta vídeos.');
         }
 
         // Mesma garantia de ordem do Instagram: o resultado do Promise.all segue a ordem da entrada.
