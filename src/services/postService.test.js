@@ -12,8 +12,8 @@ jest.mock('../adapters/prismaAdapter.js', () => ({
     excluirPostDefinitivo: jest.fn(),
     criarDraftComContas: jest.fn(),
     buscarDraftPorId: jest.fn(),
-    atualizarMidiaDraft: jest.fn(),
-    removerMidiaDraft: jest.fn(),
+    substituirMidiaDoPost: jest.fn(),
+    removerItemDeMidia: jest.fn(),
     buscarPostPorId: jest.fn(),
     listarContasDoDraft: jest.fn(),
     buscarContaPorId: jest.fn(),
@@ -139,13 +139,15 @@ describe('PostService', () => {
             const arquivo = { filename: 'foo.jpg', originalname: 'foo-original.jpg', mimetype: 'image/jpeg' };
             const accounts = [{ id: 1 }, { id: 2 }];
 
-            const resultado = await postService.gerenciarPostagemEmLote(arquivo, 'legenda', accounts, CLIENT_ID, USER_ID);
+            const resultado = await postService.gerenciarPostagemEmLote([arquivo], 'legenda', accounts, CLIENT_ID, USER_ID);
 
             expect(prismaAdapter.buscarClientePorId).toHaveBeenCalledWith(CLIENT_ID, USER_ID);
             // scheduledFor precisa ser null aqui, não o columnId — já foi um bug real (columnId caindo
             // na posição de scheduledFor por falta desse null).
             expect(prismaAdapter.criarPost).toHaveBeenCalledWith(
-                'legenda', 'foo.jpg', 'foo-original.jpg', 'image/jpeg', 'DRAFT', CLIENT_ID, null, IDEIAS_COLUMN_ID, null
+                'legenda',
+                [{ filePath: 'foo.jpg', fileName: 'foo-original.jpg', fileType: 'image/jpeg', thumbnailPath: null }],
+                'DRAFT', CLIENT_ID, null, IDEIAS_COLUMN_ID
             );
             expect(prismaAdapter.atualizarStatusPost).toHaveBeenCalledWith(42, 'PROCESSING');
             expect(publishQueue.add).toHaveBeenCalledTimes(2);
@@ -158,7 +160,7 @@ describe('PostService', () => {
             prismaAdapter.buscarClientePorId.mockResolvedValue(null);
 
             await expect(
-                postService.gerenciarPostagemEmLote({ filename: 'a', originalname: 'a', mimetype: 'image/jpeg' }, 'x', [{ id: 1 }], CLIENT_ID, USER_ID)
+                postService.gerenciarPostagemEmLote([{ filename: 'a', originalname: 'a', mimetype: 'image/jpeg' }], 'x', [{ id: 1 }], CLIENT_ID, USER_ID)
             ).rejects.toThrow(AppError);
             expect(prismaAdapter.criarPost).not.toHaveBeenCalled();
         });
@@ -167,23 +169,46 @@ describe('PostService', () => {
             prismaAdapter.criarPost.mockResolvedValue({ id: 1 });
 
             await postService.gerenciarPostagemEmLote(
-                { filename: 'a.jpg', originalname: 'a.jpg', mimetype: 'image/jpeg' }, 'x', [{ id: 1 }], CLIENT_ID, USER_ID
+                [{ filename: 'a.jpg', originalname: 'a.jpg', mimetype: 'image/jpeg' }], 'x', [{ id: 1 }], CLIENT_ID, USER_ID
             );
 
             const payload = publishQueue.add.mock.calls[0][1];
             expect(Object.keys(payload).sort()).toEqual(['accountId', 'clientId', 'postId']);
         });
+
+        test('carrossel: cria uma entrada de mídia por arquivo, na ordem enviada', async () => {
+            prismaAdapter.criarPost.mockResolvedValue({ id: 42 });
+            thumbnailService.gerar
+                .mockResolvedValueOnce('a-thumb.jpg')
+                .mockResolvedValueOnce('b-thumb.jpg');
+
+            const arquivos = [
+                { filename: 'a.jpg', originalname: 'a-orig.jpg', mimetype: 'image/jpeg' },
+                { filename: 'b.jpg', originalname: 'b-orig.jpg', mimetype: 'image/jpeg' }
+            ];
+
+            await postService.gerenciarPostagemEmLote(arquivos, 'legenda', [{ id: 1 }], CLIENT_ID, USER_ID);
+
+            expect(prismaAdapter.criarPost).toHaveBeenCalledWith(
+                'legenda',
+                [
+                    { filePath: 'a.jpg', fileName: 'a-orig.jpg', fileType: 'image/jpeg', thumbnailPath: 'a-thumb.jpg' },
+                    { filePath: 'b.jpg', fileName: 'b-orig.jpg', fileType: 'image/jpeg', thumbnailPath: 'b-thumb.jpg' }
+                ],
+                'DRAFT', CLIENT_ID, null, IDEIAS_COLUMN_ID
+            );
+        });
     });
 
     describe('agendarPostagem', () => {
-        const arquivo = { filename: 'foo.jpg', originalname: 'foo-original.jpg', mimetype: 'image/jpeg' };
+        const arquivos = [{ filename: 'foo.jpg', originalname: 'foo-original.jpg', mimetype: 'image/jpeg' }];
         const accounts = [{ id: 1 }, { id: 2 }];
 
         test('valida a posse do cliente antes de qualquer coisa', async () => {
             prismaAdapter.buscarClientePorId.mockResolvedValue(null);
 
             await expect(
-                postService.agendarPostagem(arquivo, 'c', accounts, '2999-01-01T10:00:00Z', CLIENT_ID, USER_ID)
+                postService.agendarPostagem(arquivos, 'c', accounts, '2999-01-01T10:00:00Z', CLIENT_ID, USER_ID)
             ).rejects.toThrow(AppError);
             expect(prismaAdapter.criarPost).not.toHaveBeenCalled();
             expect(publishQueue.add).not.toHaveBeenCalled();
@@ -191,20 +216,20 @@ describe('PostService', () => {
 
         test('rejeita data sem fuso horário explícito', async () => {
             await expect(
-                postService.agendarPostagem(arquivo, 'c', accounts, '2999-01-01T10:00:00', CLIENT_ID, USER_ID)
+                postService.agendarPostagem(arquivos, 'c', accounts, '2999-01-01T10:00:00', CLIENT_ID, USER_ID)
             ).rejects.toThrow(AppError);
             expect(prismaAdapter.criarPost).not.toHaveBeenCalled();
         });
 
         test('rejeita string de data inválida', async () => {
             await expect(
-                postService.agendarPostagem(arquivo, 'c', accounts, 'amanhã de manhã', CLIENT_ID, USER_ID)
+                postService.agendarPostagem(arquivos, 'c', accounts, 'amanhã de manhã', CLIENT_ID, USER_ID)
             ).rejects.toThrow(AppError);
         });
 
         test('rejeita data no passado', async () => {
             await expect(
-                postService.agendarPostagem(arquivo, 'c', accounts, '2020-01-01T00:00:00Z', CLIENT_ID, USER_ID)
+                postService.agendarPostagem(arquivos, 'c', accounts, '2020-01-01T00:00:00Z', CLIENT_ID, USER_ID)
             ).rejects.toThrow(AppError);
             expect(publishQueue.add).not.toHaveBeenCalled();
         });
@@ -215,10 +240,12 @@ describe('PostService', () => {
             publishQueue.add.mockResolvedValueOnce({ id: 'job-a' }).mockResolvedValueOnce({ id: 'job-b' });
 
             const scheduledFor = '2026-01-01T01:00:00Z'; // +1h
-            const resultado = await postService.agendarPostagem(arquivo, 'c', accounts, scheduledFor, CLIENT_ID, USER_ID);
+            const resultado = await postService.agendarPostagem(arquivos, 'c', accounts, scheduledFor, CLIENT_ID, USER_ID);
 
             expect(prismaAdapter.criarPost).toHaveBeenCalledWith(
-                'c', 'foo.jpg', 'foo-original.jpg', 'image/jpeg', 'SCHEDULED', CLIENT_ID, new Date(scheduledFor), IDEIAS_COLUMN_ID, null
+                'c',
+                [{ filePath: 'foo.jpg', fileName: 'foo-original.jpg', fileType: 'image/jpeg', thumbnailPath: null }],
+                'SCHEDULED', CLIENT_ID, new Date(scheduledFor), IDEIAS_COLUMN_ID
             );
             expect(prismaAdapter.atualizarStatusPost).toHaveBeenCalledWith(55, 'SCHEDULED');
             expect(publishQueue.add).toHaveBeenCalledWith(
@@ -358,12 +385,11 @@ describe('PostService', () => {
         test('remove jobs pendentes (se houver) e exclui o post definitivamente', async () => {
             prismaAdapter.buscarPostAgendadoComJobs.mockResolvedValue({
                 id: 8,
-                file_path: 'foo.jpg',
                 post_accounts: [{ job_id: 'job-a' }]
             });
             const jobDelayed = { getState: jest.fn().mockResolvedValue('delayed'), remove: jest.fn() };
             publishQueue.getJob.mockResolvedValueOnce(jobDelayed);
-            prismaAdapter.excluirPostDefinitivo.mockResolvedValue({ id: 8, file_path: 'foo.jpg' });
+            prismaAdapter.excluirPostDefinitivo.mockResolvedValue({ id: 8, media: [{ file_path: 'foo.jpg' }] });
 
             const resultado = await postService.excluirPost(8, CLIENT_ID, USER_ID);
 
@@ -374,7 +400,7 @@ describe('PostService', () => {
 
         test('exclui normalmente um post que não estava agendado (sem jobs pra remover)', async () => {
             prismaAdapter.buscarPostAgendadoComJobs.mockResolvedValue(null);
-            prismaAdapter.excluirPostDefinitivo.mockResolvedValue({ id: 3, file_path: 'bar.jpg' });
+            prismaAdapter.excluirPostDefinitivo.mockResolvedValue({ id: 3, media: [{ file_path: 'bar.jpg' }] });
 
             const resultado = await postService.excluirPost(3, CLIENT_ID, USER_ID);
 
@@ -384,7 +410,10 @@ describe('PostService', () => {
 
         test('remove o arquivo original e o thumbnail do disco quando existirem', async () => {
             prismaAdapter.buscarPostAgendadoComJobs.mockResolvedValue(null);
-            prismaAdapter.excluirPostDefinitivo.mockResolvedValue({ id: 3, file_path: 'bar.jpg', thumbnail_path: 'bar-thumb.jpg' });
+            prismaAdapter.excluirPostDefinitivo.mockResolvedValue({
+                id: 3,
+                media: [{ file_path: 'bar.jpg', thumbnail_path: 'bar-thumb.jpg' }]
+            });
             fs.existsSync.mockReturnValue(true);
 
             await postService.excluirPost(3, CLIENT_ID, USER_ID);
@@ -393,9 +422,27 @@ describe('PostService', () => {
             expect(fs.unlinkSync).toHaveBeenCalledWith(path.join('.uploads', 'thumbs', 'bar-thumb.jpg'));
         });
 
-        test('não tenta remover thumbnail quando o post não tem um (mídia já havia sido removida)', async () => {
+        test('carrossel: remove do disco o arquivo e o thumbnail de TODOS os itens', async () => {
             prismaAdapter.buscarPostAgendadoComJobs.mockResolvedValue(null);
-            prismaAdapter.excluirPostDefinitivo.mockResolvedValue({ id: 3, file_path: null, thumbnail_path: null });
+            prismaAdapter.excluirPostDefinitivo.mockResolvedValue({
+                id: 3,
+                media: [
+                    { file_path: 'a.jpg', thumbnail_path: 'a-thumb.jpg' },
+                    { file_path: 'b.jpg', thumbnail_path: 'b-thumb.jpg' }
+                ]
+            });
+            fs.existsSync.mockReturnValue(true);
+
+            await postService.excluirPost(3, CLIENT_ID, USER_ID);
+
+            expect(fs.unlinkSync).toHaveBeenCalledTimes(4);
+            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join('.uploads', 'b.jpg'));
+            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join('.uploads', 'thumbs', 'b-thumb.jpg'));
+        });
+
+        test('não tenta remover arquivo quando o post não tem mídia', async () => {
+            prismaAdapter.buscarPostAgendadoComJobs.mockResolvedValue(null);
+            prismaAdapter.excluirPostDefinitivo.mockResolvedValue({ id: 3, media: [] });
             fs.existsSync.mockReturnValue(true);
 
             await postService.excluirPost(3, CLIENT_ID, USER_ID);
@@ -413,7 +460,7 @@ describe('PostService', () => {
         });
 
         test('lança AppError se o draft não tem mídia', async () => {
-            prismaAdapter.buscarDraftPorId.mockResolvedValue({ id: 1, file_path: null });
+            prismaAdapter.buscarDraftPorId.mockResolvedValue({ id: 1, media: [] });
 
             await expect(postService.publicarDraft(1, CLIENT_ID, USER_ID)).rejects.toThrow(AppError);
             expect(prismaAdapter.listarContasDoDraft).not.toHaveBeenCalled();
@@ -421,7 +468,7 @@ describe('PostService', () => {
         });
 
         test('lança AppError se o draft não tem contas vinculadas', async () => {
-            prismaAdapter.buscarDraftPorId.mockResolvedValue({ id: 1, file_path: 'f' });
+            prismaAdapter.buscarDraftPorId.mockResolvedValue({ id: 1, media: [{ file_path: 'f' }] });
             prismaAdapter.listarContasDoDraft.mockResolvedValue([]);
 
             await expect(postService.publicarDraft(1, CLIENT_ID, USER_ID)).rejects.toThrow(AppError);
@@ -430,7 +477,7 @@ describe('PostService', () => {
 
         test('enfileira as contas vinculadas ao draft', async () => {
             prismaAdapter.buscarDraftPorId.mockResolvedValue({
-                id: 7, caption: 'c', file_path: 'f', file_name: 'n', file_type: 'image/jpeg'
+                id: 7, caption: 'c', media: [{ file_path: 'f', file_name: 'n', file_type: 'image/jpeg' }]
             });
             prismaAdapter.listarContasDoDraft.mockResolvedValue([{ id: 3 }]);
 
@@ -467,7 +514,7 @@ describe('PostService', () => {
         });
 
         test('lança AppError se o draft não tem mídia', async () => {
-            prismaAdapter.buscarDraftPorId.mockResolvedValue({ id: 1, file_path: null });
+            prismaAdapter.buscarDraftPorId.mockResolvedValue({ id: 1, media: [] });
 
             await expect(
                 postService.agendarDraft(1, CLIENT_ID, USER_ID, '2999-01-01T10:00:00Z')
@@ -476,7 +523,7 @@ describe('PostService', () => {
         });
 
         test('lança AppError se o draft não tem contas vinculadas', async () => {
-            prismaAdapter.buscarDraftPorId.mockResolvedValue({ id: 1, file_path: 'f' });
+            prismaAdapter.buscarDraftPorId.mockResolvedValue({ id: 1, media: [{ file_path: 'f' }] });
             prismaAdapter.listarContasDoDraft.mockResolvedValue([]);
 
             await expect(
@@ -488,7 +535,7 @@ describe('PostService', () => {
         test('caminho feliz: grava scheduled_for, marca SCHEDULED e move pra coluna Agendado', async () => {
             jest.useFakeTimers().setSystemTime(new Date('2026-01-01T00:00:00Z'));
             prismaAdapter.buscarDraftPorId.mockResolvedValue({
-                id: 9, caption: 'c', file_path: 'f', file_name: 'n', file_type: 'image/jpeg'
+                id: 9, caption: 'c', media: [{ file_path: 'f', file_name: 'n', file_type: 'image/jpeg' }]
             });
             prismaAdapter.listarContasDoDraft.mockResolvedValue([{ id: 1 }]);
             publishQueue.add.mockResolvedValueOnce({ id: 'job-a' });
@@ -511,40 +558,59 @@ describe('PostService', () => {
     });
 
     describe('atualizarMidiaDraft', () => {
-        const arquivo = { filename: 'novo.jpg', originalname: 'novo-original.jpg', mimetype: 'image/jpeg' };
+        const arquivos = [{ filename: 'novo.jpg', originalname: 'novo-original.jpg', mimetype: 'image/jpeg' }];
+        const midiaAntiga = [{ file_path: 'antigo.jpg', thumbnail_path: 'antigo-thumb.jpg' }];
 
         test('lança AppError se o draft não existe', async () => {
             prismaAdapter.buscarDraftPorId.mockResolvedValue(null);
 
             await expect(
-                postService.atualizarMidiaDraft(1, CLIENT_ID, USER_ID, arquivo)
+                postService.atualizarMidiaDraft(1, CLIENT_ID, USER_ID, arquivos)
             ).rejects.toThrow(AppError);
             expect(thumbnailService.gerar).not.toHaveBeenCalled();
-            expect(prismaAdapter.atualizarMidiaDraft).not.toHaveBeenCalled();
+            expect(prismaAdapter.substituirMidiaDoPost).not.toHaveBeenCalled();
         });
 
         test('lança AppError se o adapter não encontra o draft na hora de atualizar (corrida de status)', async () => {
-            prismaAdapter.buscarDraftPorId.mockResolvedValue({ id: 1, file_path: 'antigo.jpg', thumbnail_path: 'antigo-thumb.jpg' });
+            prismaAdapter.buscarDraftPorId.mockResolvedValue({ id: 1, media: midiaAntiga });
             thumbnailService.gerar.mockResolvedValue('novo-thumb.jpg');
-            prismaAdapter.atualizarMidiaDraft.mockResolvedValue(null);
+            prismaAdapter.substituirMidiaDoPost.mockResolvedValue(null);
 
             await expect(
-                postService.atualizarMidiaDraft(1, CLIENT_ID, USER_ID, arquivo)
+                postService.atualizarMidiaDraft(1, CLIENT_ID, USER_ID, arquivos)
             ).rejects.toThrow(AppError);
         });
 
-        test('gera thumbnail, atualiza o draft e repassa os dados corretos pro adapter', async () => {
-            prismaAdapter.buscarDraftPorId.mockResolvedValue({ id: 5, file_path: 'antigo.jpg', thumbnail_path: 'antigo-thumb.jpg' });
+        test('gera thumbnail, substitui a mídia e repassa os dados corretos pro adapter', async () => {
+            prismaAdapter.buscarDraftPorId.mockResolvedValue({ id: 5, media: midiaAntiga });
             thumbnailService.gerar.mockResolvedValue('novo-thumb.jpg');
-            prismaAdapter.atualizarMidiaDraft.mockResolvedValue({ id: 5, file_path: 'novo.jpg' });
+            prismaAdapter.substituirMidiaDoPost.mockResolvedValue({ id: 5, media: [{ file_path: 'novo.jpg' }] });
 
-            const resultado = await postService.atualizarMidiaDraft(5, CLIENT_ID, USER_ID, arquivo);
+            const resultado = await postService.atualizarMidiaDraft(5, CLIENT_ID, USER_ID, arquivos);
 
-            expect(thumbnailService.gerar).toHaveBeenCalledWith(arquivo);
-            expect(prismaAdapter.atualizarMidiaDraft).toHaveBeenCalledWith(5, CLIENT_ID, {
-                filePath: 'novo.jpg', fileName: 'novo-original.jpg', fileType: 'image/jpeg', thumbnailPath: 'novo-thumb.jpg'
+            expect(thumbnailService.gerar).toHaveBeenCalledWith(arquivos[0]);
+            expect(prismaAdapter.substituirMidiaDoPost).toHaveBeenCalledWith(5, CLIENT_ID, [
+                { filePath: 'novo.jpg', fileName: 'novo-original.jpg', fileType: 'image/jpeg', thumbnailPath: 'novo-thumb.jpg' }
+            ]);
+            expect(resultado).toEqual({ id: 5, media: [{ file_path: 'novo.jpg' }] });
+        });
+
+        test('remove do disco toda a mídia antiga, não só o primeiro item', async () => {
+            prismaAdapter.buscarDraftPorId.mockResolvedValue({
+                id: 5,
+                media: [
+                    { file_path: 'a.jpg', thumbnail_path: 'a-thumb.jpg' },
+                    { file_path: 'b.jpg', thumbnail_path: 'b-thumb.jpg' }
+                ]
             });
-            expect(resultado).toEqual({ id: 5, file_path: 'novo.jpg' });
+            prismaAdapter.substituirMidiaDoPost.mockResolvedValue({ id: 5, media: [] });
+            fs.existsSync.mockReturnValue(true);
+
+            await postService.atualizarMidiaDraft(5, CLIENT_ID, USER_ID, arquivos);
+
+            expect(fs.unlinkSync).toHaveBeenCalledTimes(4);
+            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join('.uploads', 'b.jpg'));
+            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join('.uploads', 'thumbs', 'b-thumb.jpg'));
         });
     });
 
@@ -553,24 +619,59 @@ describe('PostService', () => {
             prismaAdapter.buscarDraftPorId.mockResolvedValue(null);
 
             await expect(postService.removerMidiaDraft(1, CLIENT_ID, USER_ID)).rejects.toThrow(AppError);
-            expect(prismaAdapter.removerMidiaDraft).not.toHaveBeenCalled();
+            expect(prismaAdapter.substituirMidiaDoPost).not.toHaveBeenCalled();
         });
 
         test('lança AppError se o adapter não encontra o draft na hora de remover (corrida de status)', async () => {
-            prismaAdapter.buscarDraftPorId.mockResolvedValue({ id: 1, file_path: 'antigo.jpg' });
-            prismaAdapter.removerMidiaDraft.mockResolvedValue(null);
+            prismaAdapter.buscarDraftPorId.mockResolvedValue({ id: 1, media: [{ file_path: 'antigo.jpg' }] });
+            prismaAdapter.substituirMidiaDoPost.mockResolvedValue(null);
 
             await expect(postService.removerMidiaDraft(1, CLIENT_ID, USER_ID)).rejects.toThrow(AppError);
         });
 
-        test('remove a mídia e retorna o draft atualizado', async () => {
-            prismaAdapter.buscarDraftPorId.mockResolvedValue({ id: 5, file_path: 'antigo.jpg', thumbnail_path: 'antigo-thumb.jpg' });
-            prismaAdapter.removerMidiaDraft.mockResolvedValue({ id: 5, file_path: null, thumbnail_path: null });
+        test('remove a mídia substituindo por conjunto vazio e retorna o draft atualizado', async () => {
+            prismaAdapter.buscarDraftPorId.mockResolvedValue({
+                id: 5,
+                media: [{ file_path: 'antigo.jpg', thumbnail_path: 'antigo-thumb.jpg' }]
+            });
+            prismaAdapter.substituirMidiaDoPost.mockResolvedValue({ id: 5, media: [] });
 
             const resultado = await postService.removerMidiaDraft(5, CLIENT_ID, USER_ID);
 
-            expect(prismaAdapter.removerMidiaDraft).toHaveBeenCalledWith(5, CLIENT_ID);
-            expect(resultado).toEqual({ id: 5, file_path: null, thumbnail_path: null });
+            expect(prismaAdapter.substituirMidiaDoPost).toHaveBeenCalledWith(5, CLIENT_ID, []);
+            expect(resultado).toEqual({ id: 5, media: [] });
+        });
+    });
+
+    describe('removerItemDeMidia', () => {
+        test('lança AppError se o cliente não pertence ao usuário', async () => {
+            prismaAdapter.buscarClientePorId.mockResolvedValue(null);
+
+            await expect(postService.removerItemDeMidia(5, 1, CLIENT_ID, USER_ID)).rejects.toThrow(AppError);
+            expect(prismaAdapter.removerItemDeMidia).not.toHaveBeenCalled();
+        });
+
+        test('lança AppError se o item não existe/não pertence a esse draft', async () => {
+            prismaAdapter.removerItemDeMidia.mockResolvedValue(null);
+
+            await expect(postService.removerItemDeMidia(5, 999, CLIENT_ID, USER_ID)).rejects.toThrow(AppError);
+        });
+
+        test('remove só o item do disco, sem mexer nos outros, e devolve o draft atualizado', async () => {
+            prismaAdapter.removerItemDeMidia.mockResolvedValue({ id: 1, file_path: 'b.jpg', thumbnail_path: 'b-thumb.jpg' });
+            prismaAdapter.buscarDraftPorId.mockResolvedValue({
+                id: 5,
+                media: [{ file_path: 'a.jpg', thumbnail_path: 'a-thumb.jpg' }]
+            });
+            fs.existsSync.mockReturnValue(true);
+
+            const resultado = await postService.removerItemDeMidia(5, 1, CLIENT_ID, USER_ID);
+
+            expect(prismaAdapter.removerItemDeMidia).toHaveBeenCalledWith(1, 5, CLIENT_ID);
+            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join('.uploads', 'b.jpg'));
+            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join('.uploads', 'thumbs', 'b-thumb.jpg'));
+            expect(fs.unlinkSync).not.toHaveBeenCalledWith(path.join('.uploads', 'a.jpg'));
+            expect(resultado.media).toEqual([{ file_path: 'a.jpg', thumbnail_path: 'a-thumb.jpg' }]);
         });
     });
 
@@ -582,7 +683,10 @@ describe('PostService', () => {
         });
 
         test('remove o arquivo original e o thumbnail do disco quando existirem', async () => {
-            prismaAdapter.excluirDraft.mockResolvedValue({ id: 5, file_path: 'antigo.jpg', thumbnail_path: 'antigo-thumb.jpg' });
+            prismaAdapter.excluirDraft.mockResolvedValue({
+                id: 5,
+                media: [{ file_path: 'antigo.jpg', thumbnail_path: 'antigo-thumb.jpg' }]
+            });
             fs.existsSync.mockReturnValue(true);
 
             await postService.excluirDraft(5, CLIENT_ID, USER_ID);
@@ -592,7 +696,7 @@ describe('PostService', () => {
         });
 
         test('não tenta remover arquivos quando o draft não tem mídia', async () => {
-            prismaAdapter.excluirDraft.mockResolvedValue({ id: 5, file_path: null, thumbnail_path: null });
+            prismaAdapter.excluirDraft.mockResolvedValue({ id: 5, media: [] });
             fs.existsSync.mockReturnValue(true);
 
             await postService.excluirDraft(5, CLIENT_ID, USER_ID);

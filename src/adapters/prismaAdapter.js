@@ -25,17 +25,19 @@ const CLIENT_SELECT_FEED = {
 const POST_SELECT_BASE = {
     id: true,
     caption: true,
-    file_path: true,
-    file_name: true,
-    file_type: true,
-    thumbnail_path: true,
     status: true,
     created_at: true,
     updated_at: true,
     published_at: true,
     suggested_date: true,
-    format: true
+    format: true,
+    post_media: { orderBy: { order: 'asc' } }
 };
+
+// createManyAndReturn (usado só por criarPostsEmLotePorIA) não aceita select de relação — só campos
+// escalares. Derivado de POST_SELECT_BASE em vez de escrito à mão pra não sair de sincronia quando
+// um campo escalar novo for adicionado lá.
+const { post_media: _relacaoMidia, ...POST_SELECT_ESCALAR } = POST_SELECT_BASE;
 
 // Conjunto de status que aparece nos dois feeds — exclui DRAFT (rascunho ainda não é "conteúdo
 // entregue", nem pra troubleshooting nem pra portfólio).
@@ -57,6 +59,15 @@ const COMMENT_SELECT_BASE = {
 
 
 class PrismaAdapter {
+    // Achata post_media -> media (já vem ordenado por `order` do POST_SELECT_BASE). Mesmo critério
+    // de reshaping já usado pra post_accounts -> accounts: o nome da tabela é detalhe de
+    // persistência, quem consome (frontend, worker, adapters de plataforma) só quer "a mídia".
+    // Sempre um array — vazio quando o post não tem mídia (draft do Lab de IA, arte removida).
+    static #comMidia(post) {
+        const { post_media, ...resto } = post;
+        return { ...resto, media: post_media ?? [] };
+    }
+
     static async buscarClientePorId(clientId, userId) {
         return await prisma.clients.findFirst({
             where: { id: parseInt(clientId), user_id: userId }
@@ -236,7 +247,7 @@ class PrismaAdapter {
             return {
                 ...column,
                 posts: postsVisiveis.map(({ post_accounts, ...post }) => ({
-                    ...post,
+                    ...PrismaAdapter.#comMidia(post),
                     accounts: post_accounts.map(vinculo => vinculo.accounts)
                 }))
             };
@@ -262,20 +273,34 @@ class PrismaAdapter {
     }
 
 
-    static async criarPost(caption, filePath, fileName, fileType, status, clientId, scheduledFor = null, columnId = null, thumbnailPath = null) {
-        return await prisma.posts.create({
+    // midiaItems: [{ filePath, fileName, fileType, thumbnailPath }] na ordem de exibição do
+    // carrossel — o índice do array vira o `order`. Array vazio é válido (post sem mídia).
+    static async criarPost(caption, midiaItems, status, clientId, scheduledFor = null, columnId = null) {
+        const post = await prisma.posts.create({
             data: {
                 caption,
-                file_path: filePath,
-                file_name: fileName,
-                file_type: fileType,
                 status,
                 client_id: parseInt(clientId),
                 scheduled_for: scheduledFor,
                 column_id: columnId,
-                thumbnail_path: thumbnailPath
-            }
+                post_media: { create: PrismaAdapter.#montarMidiaParaCriacao(midiaItems) }
+            },
+            select: POST_SELECT_BASE
         });
+        return PrismaAdapter.#comMidia(post);
+    }
+
+    // Traduz o shape camelCase que os services usam pro snake_case da tabela, atribuindo o `order`
+    // pela posição no array. Único lugar que faz esse mapeamento — criarPost, criarDraftComContas e
+    // substituirMidiaDoPost compartilham.
+    static #montarMidiaParaCriacao(midiaItems = []) {
+        return midiaItems.map((item, index) => ({
+            file_path: item.filePath,
+            file_name: item.fileName,
+            file_type: item.fileType,
+            thumbnail_path: item.thumbnailPath ?? null,
+            order: index
+        }));
     }
 
     static async registrarJobAgendado(postId, accountId, jobId) {
@@ -372,19 +397,17 @@ class PrismaAdapter {
         return conta;
     }
 
-    static async criarDraftComContas(caption, fileName, filePath, fileType, clientId, accountIds, columnId = null, thumbnailPath = null) {
+    static async criarDraftComContas(caption, midiaItems, clientId, accountIds, columnId = null) {
         return await prisma.$transaction(async (tx) => {
             const draft = await tx.posts.create({
                 data: {
                     caption,
-                    file_path: filePath,
-                    file_name: fileName,
-                    file_type: fileType,
                     status: 'DRAFT',
                     client_id: parseInt(clientId),
                     column_id: columnId,
-                    thumbnail_path: thumbnailPath
-                }
+                    post_media: { create: PrismaAdapter.#montarMidiaParaCriacao(midiaItems) }
+                },
+                select: POST_SELECT_BASE
             });
 
             await tx.post_accounts.createMany({
@@ -395,21 +418,27 @@ class PrismaAdapter {
                 }))
             });
 
-            return draft;
+            return PrismaAdapter.#comMidia(draft);
         });
     }
 
     static async buscarDraftPorId(draftId, clientId) {
-        return await prisma.posts.findFirst({
+        const draft = await prisma.posts.findFirst({
             where: { id: parseInt(draftId), client_id: parseInt(clientId), status: 'DRAFT' },
             select: POST_SELECT_BASE
         });
+        return draft && PrismaAdapter.#comMidia(draft);
     }
 
+    // Consumido pelo worker (publishWorker) e repassado direto pros adapters de plataforma, que
+    // leem post.media — por isso precisa do select explícito com a relação (findUnique sem select
+    // traria só os campos escalares, e a mídia chegaria undefined lá na hora de publicar).
     static async buscarPostPorId(postId) {
-        return await prisma.posts.findUnique({
-            where: { id: postId }
+        const post = await prisma.posts.findUnique({
+            where: { id: postId },
+            select: { ...POST_SELECT_BASE, client_id: true, scheduled_for: true, column_id: true }
         });
+        return post && PrismaAdapter.#comMidia(post);
     }
 
    
@@ -473,12 +502,12 @@ class PrismaAdapter {
         };
     }
 
+    // Só serve pra localizar os job_id na fila (cancelar/reagendar/excluir) — não precisa de mídia.
     static async buscarPostAgendadoComJobs(postId, clientId) {
         return await prisma.posts.findFirst({
             where: { id: parseInt(postId), client_id: parseInt(clientId), status: 'SCHEDULED' },
             select: {
                 id: true,
-                file_path: true,
                 post_accounts: { select: { job_id: true } }
             }
         });
@@ -493,21 +522,23 @@ class PrismaAdapter {
             data: { status: 'DRAFT', scheduled_for: null, updated_at: new Date() }
         });
         if (resultado.count === 0) return null;
-        return prisma.posts.findUnique({ where: { id: parseInt(postId) }, select: POST_SELECT_BASE });
+        const post = await prisma.posts.findUnique({ where: { id: parseInt(postId) }, select: POST_SELECT_BASE });
+        return PrismaAdapter.#comMidia(post);
     }
 
     // Exclusão definitiva de post em QUALQUER status (ao contrário de excluirDraft, que só aceita
-    // DRAFT) — usada pelo botão de lixeira do popup do Kanban. card_comments tem onDelete: Cascade no
-    // schema, então os comentários somem junto automaticamente, sem precisar apagar nada à parte aqui.
+    // DRAFT) — usada pelo botão de lixeira do popup do Kanban. card_comments e post_media têm
+    // onDelete: Cascade no schema, então somem junto automaticamente — mas a mídia precisa vir no
+    // retorno pro service conseguir apagar os arquivos do disco antes de perder a referência.
     static async excluirPostDefinitivo(postId, clientId) {
         const post = await prisma.posts.findFirst({
             where: { id: parseInt(postId), client_id: parseInt(clientId) },
-            select: { id: true, file_path: true, thumbnail_path: true }
+            select: { id: true, post_media: { orderBy: { order: 'asc' } } }
         });
         if (!post) return null;
 
         await prisma.posts.delete({ where: { id: post.id } });
-        return post;
+        return PrismaAdapter.#comMidia(post);
     }
 
     static async listarStatusContasDoPost(postId) {
@@ -528,7 +559,10 @@ class PrismaAdapter {
         if (!draft) return null;
 
         const { post_accounts, ...draftSemVinculos } = draft;
-        return { ...draftSemVinculos, accounts: post_accounts.map(vinculo => vinculo.accounts) };
+        return {
+            ...PrismaAdapter.#comMidia(draftSemVinculos),
+            accounts: post_accounts.map(vinculo => vinculo.accounts)
+        };
     }
 
     static async listarContasDoDraft(draftId, clientId) {
@@ -571,7 +605,7 @@ class PrismaAdapter {
         if (!draft) return null;
 
         await prisma.posts.delete({ where: { id: draft.id } });
-        return draft;
+        return PrismaAdapter.#comMidia(draft);
     }
 
     static async atualizarDraft(draftId, caption, clientId) {
@@ -581,52 +615,60 @@ class PrismaAdapter {
         });
         if (resultado.count === 0) return null;
 
-        return await prisma.posts.findUnique({
+        const draft = await prisma.posts.findUnique({
             where: { id: parseInt(draftId) },
             select: POST_SELECT_BASE
+        });
+        return PrismaAdapter.#comMidia(draft);
+    }
+
+    // Substitui TODA a mídia de um draft pelo conjunto novo (edição no popup do Kanban) — nunca um
+    // PATCH de um item isolado, por isso delete-all + insert, mesmo padrão de
+    // substituirContasDoDraft. Transação porque é destrutivo: sem ela, uma falha no create deixaria
+    // o draft sem nenhuma mídia (pior que o estado original). midiaItems vazio é válido (equivale a
+    // remover toda a mídia). Retorna null se não for um DRAFT desse client.
+    static async substituirMidiaDoPost(draftId, clientId, midiaItems) {
+        return await prisma.$transaction(async (tx) => {
+            const { count } = await tx.posts.updateMany({
+                where: { id: parseInt(draftId), client_id: parseInt(clientId), status: 'DRAFT' },
+                data: { updated_at: new Date() }
+            });
+            if (count === 0) return null;
+
+            await tx.post_media.deleteMany({ where: { post_id: parseInt(draftId) } });
+
+            const novaMidia = PrismaAdapter.#montarMidiaParaCriacao(midiaItems);
+            if (novaMidia.length > 0) {
+                await tx.post_media.createMany({
+                    data: novaMidia.map(item => ({ ...item, post_id: parseInt(draftId) }))
+                });
+            }
+
+            const draft = await tx.posts.findUnique({
+                where: { id: parseInt(draftId) },
+                select: POST_SELECT_BASE
+            });
+            return PrismaAdapter.#comMidia(draft);
         });
     }
 
-    // Substitui a mídia de um draft existente (edição no popup do Kanban). dadosMidia já vem pronto do
-    // service: { filePath, fileName, fileType, thumbnailPath }. Mesmo padrão de atualizarDraft
-    // (updateMany + count check + findUnique) — só aceita se o post ainda for DRAFT.
-    static async atualizarMidiaDraft(draftId, clientId, dadosMidia) {
-        const resultado = await prisma.posts.updateMany({
-            where: { id: parseInt(draftId), client_id: parseInt(clientId), status: 'DRAFT' },
-            data: {
-                file_path: dadosMidia.filePath,
-                file_name: dadosMidia.fileName,
-                file_type: dadosMidia.fileType,
-                thumbnail_path: dadosMidia.thumbnailPath,
-                updated_at: new Date()
+    // Remove só UM item do carrossel, sem tocar nos demais — complementa substituirMidiaDoPost
+    // (que troca o conjunto inteiro). Retorna o item apagado (pro service limpar o disco) ou null
+    // se não achou (mediaId não existe, não pertence a esse draft, ou draft não é DRAFT/não é desse
+    // client). Não renumera o `order` dos itens restantes: um buraco na sequência (ex.: 0, 2) não
+    // afeta o ORDER BY que já é usado em todo select — só a contiguidade, que ninguém depende dela.
+    static async removerItemDeMidia(mediaId, draftId, clientId) {
+        const item = await prisma.post_media.findFirst({
+            where: {
+                id: parseInt(mediaId),
+                post_id: parseInt(draftId),
+                posts: { client_id: parseInt(clientId), status: 'DRAFT' }
             }
         });
-        if(resultado.count === 0) return null;
-        return await prisma.posts.findUnique({
-            where: { id: parseInt(draftId) },
-            select: POST_SELECT_BASE
-        });
-    }
+        if (!item) return null;
 
-    // Limpa a mídia de um draft (botão de lixeira) — post fica com file_path/file_name/file_type/
-    // thumbnail_path todos null, permanecendo DRAFT normalmente (só sem mídia até o usuário anexar
-    // outra). Mesmo padrão updateMany + count check + findUnique.
-    static async removerMidiaDraft(draftId, clientId) {
-        const resultado = await prisma.posts.updateMany({
-            where: { id: parseInt(draftId), client_id: parseInt(clientId), status: 'DRAFT' },
-            data: {
-                file_path: null,
-                file_name: null,
-                file_type: null,
-                thumbnail_path: null,
-                updated_at: new Date()
-            }
-        });
-        if(resultado.count === 0) return null;
-        return await prisma.posts.findUnique({
-            where: { id: parseInt(draftId) },
-            select: POST_SELECT_BASE
-        });
+        await prisma.post_media.delete({ where: { id: item.id } });
+        return item;
     }
 
     static async listarDrafts(clientId) {
@@ -640,19 +682,19 @@ class PrismaAdapter {
         });
 
         return drafts.map(({ post_accounts, ...draft }) => ({
-            ...draft,
+            ...PrismaAdapter.#comMidia(draft),
             accounts: post_accounts.map(vinculo => vinculo.accounts)
         }));
     }
 
-    // Achata post_accounts -> accounts (com delivery_status/error_message embutidos) e, quando
-    // incluirAutor, renomeia clients -> author. Fonte única de shaping reaproveitada pelos dois
-    // feeds, pra não duplicar esse .map() em cada método de listagem.
+    // Achata post_accounts -> accounts (com delivery_status/error_message embutidos), post_media ->
+    // media e, quando incluirAutor, renomeia clients -> author. Fonte única de shaping reaproveitada
+    // pelos dois feeds, pra não duplicar esse .map() em cada método de listagem.
     static #formatarPostDoFeed(post, { incluirAutor }) {
         const { post_accounts, clients, ...resto } = post;
 
         const postFormatado = {
-            ...resto,
+            ...PrismaAdapter.#comMidia(resto),
             accounts: post_accounts.map(vinculo => ({
                 ...vinculo.accounts,
                 delivery_status: vinculo.delivery_status,
@@ -749,7 +791,7 @@ class PrismaAdapter {
     }
 
     static async criarPostsEmLotePorIA (clientId, columnId, posts) {
-        return await prisma.posts.createManyAndReturn({
+        const criados = await prisma.posts.createManyAndReturn({
             data: posts.map(post => ({
                 caption: post.caption ?? null,
                 format: post.format ?? null,
@@ -758,8 +800,12 @@ class PrismaAdapter {
                 client_id: parseInt(clientId),
                 column_id: columnId
             })),
-            select: POST_SELECT_BASE
+            select: POST_SELECT_ESCALAR
         });
+
+        // media sempre [] — post importado do PDF nasce sem arquivo. Devolvido explicitamente pro
+        // shape bater com o de qualquer outra leitura de post (frontend não precisa de caso especial).
+        return criados.map(post => ({ ...post, media: [] }));
     }
 }
 

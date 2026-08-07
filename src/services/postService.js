@@ -19,6 +19,29 @@ class PostService {
         }
     }
 
+    // Apaga do disco o arquivo original e o thumbnail de cada item de mídia de um post. Ponto único
+    // usado por toda exclusão/substituição de mídia (excluirPost, excluirDraft, atualizarMidiaDraft,
+    // removerMidiaDraft) — antes isso era um par de ifs repetido em cada um, e com carrossel viraria
+    // um par de loops repetido. Tolera media undefined/vazio (post sem mídia é estado válido).
+    static #removerMidiaDoDisco (media = []) {
+        media.forEach(item => {
+            if (item.file_path) this.#removerArquivoLocal({ path: path.join(UPLOADS_DIR, item.file_path) });
+            if (item.thumbnail_path) this.#removerArquivoLocal({ path: path.join(UPLOADS_DIR, 'thumbs', item.thumbnail_path) });
+        });
+    }
+
+    // Converte os arquivos do multer (req.files) no shape que o adapter espera, gerando o thumbnail
+    // de cada um. A ordem do array é a ordem do carrossel. thumbnailService.gerar nunca lança (já
+    // devolve null em caso de falha), então um thumbnail quebrado não derruba o upload inteiro.
+    static async #montarMidiaItems (arquivos) {
+        return Promise.all(arquivos.map(async arquivo => ({
+            filePath: arquivo.filename,
+            fileName: arquivo.originalname,
+            fileType: arquivo.mimetype,
+            thumbnailPath: await thumbnailService.gerar(arquivo)
+        })));
+    }
+
     // Confere que o client pertence ao usuário autenticado (agência) antes de liberar qualquer
     // operação nas contas/posts desse client.
     static async #validarCliente (clientId, userId) {
@@ -142,24 +165,19 @@ class PostService {
         if (post) await this.#moverParaColunaFixa(postId, post.client_id, FIXED_COLUMN_KEYS.FINALIZADO);
     }
 
-    static async gerenciarPostagemEmLote (arquivo, caption, accountsList, clientId, userId, columnIdExplicito) {
+    // arquivos: array de req.files (multer). 1 item = post simples, 2+ = carrossel — o backend não
+    // trata os dois casos de forma diferente, só a contagem muda.
+    static async gerenciarPostagemEmLote (arquivos, caption, accountsList, clientId, userId, columnIdExplicito) {
         await this.#validarCliente(clientId, userId);
 
         const columnId = await this.#resolverColumnId(clientId, columnIdExplicito);
-        const thumbnailPath = await thumbnailService.gerar(arquivo);
-        const novoPost = await prismaAdapter.criarPost(caption, arquivo.filename, arquivo.originalname, arquivo.mimetype, 'DRAFT', clientId, null, columnId, thumbnailPath);
+        const midiaItems = await this.#montarMidiaItems(arquivos);
+        const novoPost = await prismaAdapter.criarPost(caption, midiaItems, 'DRAFT', clientId, null, columnId);
 
-        const post = {
-            id: novoPost.id,
-            caption,
-            file_path: arquivo.filename,
-            file_name: arquivo.originalname,
-            file_type: arquivo.mimetype
-        };
-        return this.#enfileirarContas(post, accountsList, clientId);
+        return this.#enfileirarContas(novoPost, accountsList, clientId);
     }
 
-    static async agendarPostagem (arquivo, caption, accountsList, scheduledFor, clientId, userId, columnIdExplicito) {
+    static async agendarPostagem (arquivos, caption, accountsList, scheduledFor, clientId, userId, columnIdExplicito) {
         await this.#validarCliente(clientId, userId);
         await this.#validarDataFutura(scheduledFor);
 
@@ -170,18 +188,10 @@ class PostService {
         }
 
         const columnId = await this.#resolverColumnId(clientId, columnIdExplicito);
-        const thumbnailPath = await thumbnailService.gerar(arquivo);
-        const novoPost = await prismaAdapter.criarPost(caption, arquivo.filename, arquivo.originalname, arquivo.mimetype, 'SCHEDULED', clientId, data, columnId, thumbnailPath);
+        const midiaItems = await this.#montarMidiaItems(arquivos);
+        const novoPost = await prismaAdapter.criarPost(caption, midiaItems, 'SCHEDULED', clientId, data, columnId);
 
-        const post = {
-            id: novoPost.id,
-            caption,
-            file_path: arquivo.filename,
-            file_name: arquivo.originalname,
-            file_type: arquivo.mimetype
-        };
-
-        return this.#enfileirarContas(post, accountsList, clientId, { delayMs, statusInicial: 'SCHEDULED' });
+        return this.#enfileirarContas(novoPost, accountsList, clientId, { delayMs, statusInicial: 'SCHEDULED' });
     }
 
     static async consultarStatusPost (postId, clientId, userId) {
@@ -276,15 +286,12 @@ class PostService {
         const post = await prismaAdapter.excluirPostDefinitivo(postId, clientId);
         if (!post) throw new AppError('Post não encontrado');
 
-        // file_path/thumbnail_path podem ser null (post sem mídia — removida no editor do Kanban
-        // antes da exclusão).
-        if (post.file_path) this.#removerArquivoLocal({ path: path.join(UPLOADS_DIR, post.file_path) });
-        if (post.thumbnail_path) this.#removerArquivoLocal({ path: path.join(UPLOADS_DIR, 'thumbs', post.thumbnail_path) });
+        this.#removerMidiaDoDisco(post.media);
 
         return { message: 'Post excluído com sucesso', postId };
     }
 
-    static async criarDraft (caption, arquivo, accountIds, clientId, userId, columnIdExplicito) {
+    static async criarDraft (caption, arquivos, accountIds, clientId, userId, columnIdExplicito) {
         await this.#validarCliente(clientId, userId);
 
         if (!Array.isArray(accountIds) || accountIds.length === 0) {
@@ -292,8 +299,8 @@ class PostService {
         }
 
         const columnId = await this.#resolverColumnId(clientId, columnIdExplicito);
-        const thumbnailPath = await thumbnailService.gerar(arquivo);
-        return prismaAdapter.criarDraftComContas(caption, arquivo.originalname, arquivo.filename, arquivo.mimetype, clientId, accountIds, columnId, thumbnailPath);
+        const midiaItems = await this.#montarMidiaItems(arquivos);
+        return prismaAdapter.criarDraftComContas(caption, midiaItems, clientId, accountIds, columnId);
     }
 
     static async publicarDraft (draftId, clientId, userId) {
@@ -302,7 +309,7 @@ class PostService {
         const draft = await prismaAdapter.buscarDraftPorId(draftId, clientId);
         if (!draft) throw new AppError('Draft não encontrado');
 
-        if (!draft.file_path) throw new AppError('Adicione uma mídia antes de publicar');
+        if (draft.media.length === 0) throw new AppError('Adicione uma mídia antes de publicar');
         const contasVinculadas = await prismaAdapter.listarContasDoDraft(draftId, clientId);
         if (contasVinculadas.length === 0) throw new AppError('Este rascunho não possui contas vinculadas');
 
@@ -326,7 +333,7 @@ class PostService {
         const draft = await prismaAdapter.buscarDraftPorId(draftId, clientId);
         if (!draft) throw new AppError('Draft não encontrado');
 
-        if (!draft.file_path) throw new AppError('Adicione uma mídia antes de agendar');
+        if (draft.media.length === 0) throw new AppError('Adicione uma mídia antes de agendar');
 
         const contasVinculadas = await prismaAdapter.listarContasDoDraft(draftId, clientId);
         if (contasVinculadas.length === 0) throw new AppError('Este rascunho não possui contas vinculadas');
@@ -344,38 +351,49 @@ class PostService {
         return draftAtualizado;
     }
 
-    // Substitui a mídia de um draft existente (drag&drop ou clique no lápis, no popup do Kanban).
-    // arquivo vem de req.file (multer), já salvo em disco pelo controller antes de chegar aqui.
-    static async atualizarMidiaDraft (draftId, clientId, userId, arquivo) {
+    // Substitui TODA a mídia de um draft (drag&drop ou clique no lápis, no popup do Kanban) — o
+    // conjunto novo troca o antigo por inteiro, não soma. arquivos vem de req.files (multer), já
+    // salvos em disco pelo controller antes de chegar aqui.
+    static async atualizarMidiaDraft (draftId, clientId, userId, arquivos) {
         await this.#validarCliente(clientId, userId);
         const draftAtual = await prismaAdapter.buscarDraftPorId(draftId, clientId);
         if (!draftAtual) throw new AppError('Draft não encontrado');
 
-        const thumbnailPath = await thumbnailService.gerar(arquivo);
-        const draftAtualizado = await prismaAdapter.atualizarMidiaDraft(draftId, clientId, {
-            filePath: arquivo.filename,
-            fileName: arquivo.originalname,
-            fileType: arquivo.mimetype,
-            thumbnailPath
-        });
+        const midiaItems = await this.#montarMidiaItems(arquivos);
+        const draftAtualizado = await prismaAdapter.substituirMidiaDoPost(draftId, clientId, midiaItems);
         if (!draftAtualizado) throw new AppError('Draft não encontrado');
 
-        if (draftAtual.file_path) this.#removerArquivoLocal({ path: path.join(UPLOADS_DIR, draftAtual.file_path) });
-        if (draftAtual.thumbnail_path) this.#removerArquivoLocal({ path: path.join(UPLOADS_DIR, 'thumbs', draftAtual.thumbnail_path) });
+        this.#removerMidiaDoDisco(draftAtual.media);
         return draftAtualizado;
     }
 
     // Remove a mídia de um draft (lixeira no popup) — post continua DRAFT, só fica sem arquivo até o
     // usuário anexar outro (ou publicar/agendar, o que passa a ser bloqueado enquanto estiver vazio).
+    // Substituir por conjunto vazio é exatamente "remover tudo", por isso reusa substituirMidiaDoPost.
     static async removerMidiaDraft (draftId, clientId, userId) {
         await this.#validarCliente(clientId, userId);
         const draftAtual = await prismaAdapter.buscarDraftPorId(draftId, clientId);
         if (!draftAtual) throw new AppError('Draft não encontrado');
-        const draftAtualizado = await prismaAdapter.removerMidiaDraft(draftId, clientId);
+
+        const draftAtualizado = await prismaAdapter.substituirMidiaDoPost(draftId, clientId, []);
         if (!draftAtualizado) throw new AppError('Draft não encontrado');
-        if (draftAtual.file_path) this.#removerArquivoLocal({ path: path.join(UPLOADS_DIR, draftAtual.file_path) });
-        if (draftAtual.thumbnail_path) this.#removerArquivoLocal({ path: path.join(UPLOADS_DIR, 'thumbs', draftAtual.thumbnail_path) });
+
+        this.#removerMidiaDoDisco(draftAtual.media);
         return draftAtualizado;
+    }
+
+    // Remove só um item do carrossel (o "X" na miniatura, no popup do Kanban), mantendo os demais
+    // intocados — ao contrário de removerMidiaDraft, que zera tudo. Reaproveita a busca do draft
+    // atualizado em vez de montar a resposta à mão, pra bater exatamente com o shape que o
+    // frontend já espera de qualquer outra leitura de draft.
+    static async removerItemDeMidia (draftId, mediaId, clientId, userId) {
+        await this.#validarCliente(clientId, userId);
+
+        const itemRemovido = await prismaAdapter.removerItemDeMidia(mediaId, draftId, clientId);
+        if (!itemRemovido) throw new AppError('Mídia não encontrada neste draft');
+
+        this.#removerMidiaDoDisco([itemRemovido]);
+        return prismaAdapter.buscarDraftPorId(draftId, clientId);
     }
 
     static async buscarDraft (draftId, clientId, userId) {
@@ -399,10 +417,7 @@ class PostService {
         const draft = await prismaAdapter.excluirDraft(draftId, clientId);
         if (!draft) throw new AppError('Draft não encontrado');
 
-        // file_path/thumbnail_path podem ser null (draft sem mídia — removida no editor do Kanban
-        // antes da exclusão).
-        if (draft.file_path) this.#removerArquivoLocal({ path: path.join(UPLOADS_DIR, draft.file_path) });
-        if (draft.thumbnail_path) this.#removerArquivoLocal({ path: path.join(UPLOADS_DIR, 'thumbs', draft.thumbnail_path) });
+        this.#removerMidiaDoDisco(draft.media);
         return draft;
     }
 

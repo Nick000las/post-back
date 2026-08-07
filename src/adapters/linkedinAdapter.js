@@ -13,11 +13,18 @@ class LinkedinAdapter {
             throw new AppError('URN do Linkedin inválido ou ausente.');
         }
 
-        if (!post.file_path) {
+        // Rejeita carrossel explicitamente: sem isso, os itens extras seriam ignorados em silêncio
+        // e o usuário publicaria só o primeiro achando que publicou todos.
+        if (post.media.length > 1) {
+            throw new AppError('O Linkedin não suporta carrossel nessa integração.');
+        }
+
+        const [midia] = post.media;
+        if (!midia) {
             return this.#publicarTexto(post.caption, accessToken, authorUrn);
         }
 
-        return this.#publicarComMedia(post, accessToken, authorUrn);
+        return this.#publicarComMedia(post, midia, accessToken, authorUrn);
     }
 
     static async #publicarTexto (texto, accessToken, authorUrn) {
@@ -37,10 +44,10 @@ class LinkedinAdapter {
         return { success: true, externalId: data.id };
     }
 
-    static async #publicarComMedia (post, accessToken, authorUrn) {
-        const { uploadUrl, assetUrn, isVideo } = await this.#registrarUploadMidia(authorUrn, accessToken, post.file_type);
+    static async #publicarComMedia (post, midia, accessToken, authorUrn) {
+        const { uploadUrl, assetUrn, isVideo } = await this.#registrarUploadMidia(authorUrn, accessToken, midia.file_type);
 
-        await this.#enviarArquivoBinario(post.file_path, uploadUrl, accessToken);
+        await this.#enviarArquivoBinario(midia.file_path, uploadUrl, accessToken);
 
         const body = {
             author: authorUrn,
@@ -52,9 +59,9 @@ class LinkedinAdapter {
                     media: [
                         {
                             status: 'READY',
-                            description: { text: post.file_name },
+                            description: { text: midia.file_name },
                             media: assetUrn,
-                            title: { text: post.file_name }
+                            title: { text: midia.file_name }
                         }
                     ]
                 }

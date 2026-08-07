@@ -9,20 +9,27 @@ class TiktokAdapter {
     static async publicarContainer (post, accessToken, tiktokAccountId) {
         if (!tiktokAccountId) throw new AppError('ID da conta do TikTok ausente.');
 
-        if (!post.file_path || !post.file_type.startsWith('video/')) {
+        // Rejeita carrossel explicitamente: sem isso, os itens extras seriam ignorados em silêncio
+        // e o usuário publicaria só o primeiro achando que publicou todos.
+        if (post.media.length > 1) {
+            throw new AppError('O TikTok não suporta carrossel nessa integração.');
+        }
+
+        const [midia] = post.media;
+        if (!midia || !midia.file_type.startsWith('video/')) {
             throw new AppError('O TikTok suporta apenas uploads de vídeo nessa integração.');
         }
 
-        return this.#publicarVideo(post, accessToken);
+        return this.#publicarVideo(post, midia, accessToken);
     }
 
-    static async #publicarVideo (post, accessToken) {
-        const caminhoCompleto = path.join(UPLOADS_DIR, post.file_path);
+    static async #publicarVideo (post, midia, accessToken) {
+        const caminhoCompleto = path.join(UPLOADS_DIR, midia.file_path);
         const { size: tamanhoArquivo } = fs.statSync(caminhoCompleto);
 
         const initData = await this.#inicializarUpload(post, accessToken, tamanhoArquivo);
 
-        await this.#enviarArquivoBinario(caminhoCompleto, initData.upload_url, post.file_type, tamanhoArquivo);
+        await this.#enviarArquivoBinario(caminhoCompleto, initData.upload_url, midia.file_type, tamanhoArquivo);
 
         return { success: true, externalId: initData.publish_id };
     }

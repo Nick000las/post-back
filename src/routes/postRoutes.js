@@ -29,24 +29,33 @@ const criarFiltroDeArquivo = (tiposPermitidos, mensagemErro) => (req, file, cb) 
     }
 };
 
+// Teto do carrossel do Instagram — as outras plataformas rejeitam antes disso de qualquer forma
+// (TikTok/Linkedin nem aceitam carrossel nesta integração).
+const MAX_CAROUSEL_ITEMS = 10;
+
 const uploadMidia = multer({
     storage,
     fileFilter: criarFiltroDeArquivo(ALLOWED_MIDIA_MIME_TYPES, 'Formato não suportado. Use JPEG, PNG, MP4 ou MOV'),
     limits: { fileSize: 300 * 1024 * 1024 }
 });
 
-router.post('/upload/lote', authMiddleware.verificarToken, uploadMidia.single('arquivo'), postController.publicarEmLote);
-router.post('/upload/draft', authMiddleware.verificarToken, uploadMidia.single('arquivo'), postController.salvarDraft);
-router.post('/upload/schedule', authMiddleware.verificarToken, uploadMidia.single('arquivo'), postController.agendarPostagem);
+// Todas as rotas de mídia aceitam N arquivos no MESMO campo 'arquivo': 1 = post simples, 2+ =
+// carrossel. Não há rota separada pra carrossel — a contagem é o que distingue.
+const uploadCarrossel = uploadMidia.array('arquivo', MAX_CAROUSEL_ITEMS);
+
+router.post('/upload/lote', authMiddleware.verificarToken, uploadCarrossel, postController.publicarEmLote);
+router.post('/upload/draft', authMiddleware.verificarToken, uploadCarrossel, postController.salvarDraft);
+router.post('/upload/schedule', authMiddleware.verificarToken, uploadCarrossel, postController.agendarPostagem);
 router.delete('/schedule/:id', authMiddleware.verificarToken, postController.cancelarAgendamento);
 router.put('/schedule/:id', authMiddleware.verificarToken, postController.alterarDataAgendamento);
 router.delete('/posts/:id', authMiddleware.verificarToken, postController.excluirPost);
 router.post('/draft/:id/publish', authMiddleware.verificarToken, postController.publicarDraft);
 router.post('/draft/:id/schedule', authMiddleware.verificarToken, postController.agendarDraft);
 router.put('/draft/:id', authMiddleware.verificarToken, postController.atualizarDraft);
-router.put('/draft/:id/media', authMiddleware.verificarToken, uploadMidia.single('arquivo'), postController.atualizarMidiaDraft);
+router.put('/draft/:id/media', authMiddleware.verificarToken, uploadCarrossel, postController.atualizarMidiaDraft);
 router.put('/draft/:id/accounts', authMiddleware.verificarToken, postController.vincularContasAoDraft);
 router.delete('/draft/:id/media', authMiddleware.verificarToken, postController.removerMidiaDraft);
+router.delete('/draft/:id/media/:mediaId', authMiddleware.verificarToken, postController.removerItemDeMidia);
 router.delete('/draft/:id', authMiddleware.verificarToken, postController.excluirDraft);
 router.get('/draft/:id', authMiddleware.verificarToken, postController.buscarDraft);
 router.get('/drafts', authMiddleware.verificarToken, postController.listarDrafts);

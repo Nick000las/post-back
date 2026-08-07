@@ -50,20 +50,36 @@ model post_accounts {
   @@id([post_id, account_id])
 }
 
+// Mídia de um post. Substitui as antigas colunas escalares file_path/file_name/file_type/
+// thumbnail_path de posts: agora TODO post guarda mídia aqui, inclusive o de arquivo único
+// (que é só um "carrossel de 1 item"). 0 linhas = draft sem mídia, 1 = post simples, 2+ = carrossel.
+// Não há distinção de modelo entre simples e carrossel — só a contagem muda.
+model post_media {
+  id             Int       @id @default(autoincrement())
+  post_id        Int
+  file_path      String    @db.VarChar(255)
+  file_name      String    @db.VarChar(255)
+  file_type      String    @db.VarChar(100)
+  // Miniatura gerada no upload (relativa a .uploads/thumbs/). Nullable: a geração pode falhar sem
+  // derrubar o upload principal — o frontend cai pro file_path quando for null.
+  thumbnail_path String?   @db.VarChar(255)
+  // Posição no carrossel (0-based = ordem de upload). Toda edição de mídia reescreve o conjunto
+  // inteiro (prismaAdapter.substituirMidiaDoPost faz delete-all + insert, mesmo padrão de
+  // substituirContasDoDraft) — nunca há PATCH incremental de um item isolado.
+  order          Int
+  created_at     DateTime? @default(now()) @db.Timestamptz(6)
+  posts          posts     @relation(fields: [post_id], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_media_post")
+
+  @@index([post_id, order])
+}
+
 /// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
 model posts {
   id             Int             @id @default(autoincrement())
   caption        String?
-  // Nullable: um draft pode ficar temporariamente sem mídia (removida no editor do Kanban, ou — no
-  // futuro — criado por IA antes de qualquer arquivo existir). publicarDraft/agendarDraft bloqueiam a
-  // publicação enquanto file_path for null.
-  file_path      String?         @db.VarChar(255)
-  file_name      String?         @db.VarChar(255)
-  file_type      String?         @db.VarChar(100)
-  // Caminho (relativo a .uploads/thumbs/) da miniatura gerada no upload. Nullable: posts anteriores a
-  // essa feature não têm, e a geração pode falhar sem que isso derrube o upload principal — o
-  // frontend deve cair para file_path quando thumbnail_path for null.
-  thumbnail_path String?         @db.VarChar(255)
+  // A mídia NÃO vive mais aqui — migrou pra post_media (ver aquele model). Um post sem nenhuma
+  // linha em post_media é um draft sem mídia (estado válido: criado pelo Lab de IA, ou teve a arte
+  // removida no editor do Kanban); 1 linha é post simples; 2+ é carrossel.
   status         String          @default("DRAFT") @db.VarChar(20)
   // TODO (agendamento): horário alvo da publicação, em UTC. Preencher só quando status = 'SCHEDULED'.
   scheduled_for  DateTime?       @db.Timestamptz(6)
@@ -89,6 +105,7 @@ model posts {
   column_id      Int?
   created_at     DateTime?       @default(now()) @db.Timestamptz(6)
   updated_at     DateTime?       @default(now()) @db.Timestamptz(6)
+  post_media     post_media[]
   post_accounts  post_accounts[]
   card_comments  card_comments[]
   clients        clients         @relation(fields: [client_id], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_post_client")
