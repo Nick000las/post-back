@@ -19,6 +19,8 @@ jest.mock('../adapters/prismaAdapter.js', () => ({
     buscarContaPorId: jest.fn(),
     substituirContasDoDraft: jest.fn(),
     excluirDraft: jest.fn(),
+    contarUsosDeArquivo: jest.fn(),
+    contarUsosDeThumbnail: jest.fn(),
     // Kanban: buscarColunaIdeias é chamado por baixo dos panos (via kanbanService.resolverColunaIdeias)
     // sempre que um post é criado sem columnId explícito — ou seja, em todo teste de criação de post.
     buscarColunaIdeias: jest.fn(),
@@ -63,6 +65,11 @@ describe('PostService', () => {
         prismaAdapter.buscarColunaPorFixedKey.mockResolvedValue({ id: 2002 });
         thumbnailService.gerar.mockResolvedValue(null);
         publishQueue.add.mockResolvedValue({ id: 'job-1' });
+        // Default: nenhum outro post_media referencia o mesmo arquivo (caso comum, FEED nunca
+        // compartilha arquivo entre posts) — testes de série de Story sobrescrevem isso pra simular
+        // compartilhamento.
+        prismaAdapter.contarUsosDeArquivo.mockResolvedValue(0);
+        prismaAdapter.contarUsosDeThumbnail.mockResolvedValue(0);
         // jest.clearAllMocks() (no afterEach) limpa chamadas, mas não desfaz mockReturnValue —
         // sem isso, um teste que liga existsSync pra true vazaria esse valor pros seguintes.
         fs.existsSync.mockReturnValue(false);
@@ -149,7 +156,7 @@ describe('PostService', () => {
                 [{ filePath: 'foo.jpg', fileName: 'foo-original.jpg', fileType: 'image/jpeg', thumbnailPath: null }],
                 'DRAFT', CLIENT_ID, null, IDEIAS_COLUMN_ID
             );
-            expect(prismaAdapter.atualizarStatusPost).toHaveBeenCalledWith(42, 'PROCESSING');
+            expect(prismaAdapter.atualizarStatusPost).toHaveBeenCalledWith(42, 'PROCESSING', {});
             expect(publishQueue.add).toHaveBeenCalledTimes(2);
             expect(publishQueue.add).toHaveBeenCalledWith('publicar-conta', { postId: 42, accountId: 1, clientId: CLIENT_ID }, {});
             expect(prismaAdapter.registrarJobAgendado).not.toHaveBeenCalled();
@@ -247,7 +254,7 @@ describe('PostService', () => {
                 [{ filePath: 'foo.jpg', fileName: 'foo-original.jpg', fileType: 'image/jpeg', thumbnailPath: null }],
                 'SCHEDULED', CLIENT_ID, new Date(scheduledFor), IDEIAS_COLUMN_ID
             );
-            expect(prismaAdapter.atualizarStatusPost).toHaveBeenCalledWith(55, 'SCHEDULED');
+            expect(prismaAdapter.atualizarStatusPost).toHaveBeenCalledWith(55, 'SCHEDULED', {});
             expect(publishQueue.add).toHaveBeenCalledWith(
                 'publicar-conta', { postId: 55, accountId: 1, clientId: CLIENT_ID }, { delay: 3600000 }
             );
@@ -440,6 +447,23 @@ describe('PostService', () => {
             expect(fs.unlinkSync).toHaveBeenCalledWith(path.join('.uploads', 'thumbs', 'b-thumb.jpg'));
         });
 
+        test('não apaga do disco um arquivo ainda referenciado por outra ocorrência da mesma série de Story', async () => {
+            prismaAdapter.buscarPostAgendadoComJobs.mockResolvedValue(null);
+            prismaAdapter.excluirPostDefinitivo.mockResolvedValue({
+                id: 3,
+                media: [{ file_path: 'story.jpg', thumbnail_path: 'story-thumb.jpg' }]
+            });
+            fs.existsSync.mockReturnValue(true);
+            // Simula o draft sobrevivente do colapso de cancelarSerie: ainda existe 1 post_media
+            // (o dele) apontando pro mesmo arquivo, então a contagem não é zero.
+            prismaAdapter.contarUsosDeArquivo.mockResolvedValue(1);
+            prismaAdapter.contarUsosDeThumbnail.mockResolvedValue(1);
+
+            await postService.excluirPost(3, CLIENT_ID, USER_ID);
+
+            expect(fs.unlinkSync).not.toHaveBeenCalled();
+        });
+
         test('não tenta remover arquivo quando o post não tem mídia', async () => {
             prismaAdapter.buscarPostAgendadoComJobs.mockResolvedValue(null);
             prismaAdapter.excluirPostDefinitivo.mockResolvedValue({ id: 3, media: [] });
@@ -483,7 +507,7 @@ describe('PostService', () => {
 
             const resultado = await postService.publicarDraft(7, CLIENT_ID, USER_ID);
 
-            expect(prismaAdapter.atualizarStatusPost).toHaveBeenCalledWith(7, 'PROCESSING');
+            expect(prismaAdapter.atualizarStatusPost).toHaveBeenCalledWith(7, 'PROCESSING', {});
             expect(publishQueue.add).toHaveBeenCalledWith('publicar-conta', { postId: 7, accountId: 3, clientId: CLIENT_ID }, {});
             expect(resultado).toEqual({ status: 'queued', postId: 7, totalContas: 1 });
         });
@@ -544,7 +568,7 @@ describe('PostService', () => {
             const resultado = await postService.agendarDraft(9, CLIENT_ID, USER_ID, scheduledFor);
 
             expect(prismaAdapter.atualizarScheduledFor).toHaveBeenCalledWith(9, new Date(scheduledFor));
-            expect(prismaAdapter.atualizarStatusPost).toHaveBeenCalledWith(9, 'SCHEDULED');
+            expect(prismaAdapter.atualizarStatusPost).toHaveBeenCalledWith(9, 'SCHEDULED', {});
             expect(publishQueue.add).toHaveBeenCalledWith(
                 'publicar-conta', { postId: 9, accountId: 1, clientId: CLIENT_ID }, { delay: 3600000 }
             );
@@ -849,7 +873,7 @@ describe('PostService', () => {
             expect(prismaAdapter.vincularPostConta).toHaveBeenCalledWith(1, 2, 'PENDING', null, null);
             expect(publishQueue.add).toHaveBeenCalledTimes(1);
             expect(publishQueue.add).toHaveBeenCalledWith('publicar-conta', { postId: 1, accountId: 2, clientId: CLIENT_ID }, {});
-            expect(prismaAdapter.atualizarStatusPost).toHaveBeenCalledWith(1, 'PROCESSING');
+            expect(prismaAdapter.atualizarStatusPost).toHaveBeenCalledWith(1, 'PROCESSING', {});
             expect(resultado).toEqual({ status: 'queued', postId: 1, totalContas: 1 });
         });
     });

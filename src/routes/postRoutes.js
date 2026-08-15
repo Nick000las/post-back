@@ -1,43 +1,12 @@
 const express = require('express');
-const multer = require('multer');
 const router = express.Router();
-const path = require('path');
-const fs = require('fs');
 const postController = require('../controllers/postController.js');
 const authMiddleware = require('../middlewares/authMiddleware.js');
-
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        const dir = '.uploads';
-        if (!fs.existsSync(dir)) fs.mkdirSync(dir);
-        cb(null, dir);
-    },
-    filename: (req, file, cb) => {
-        cb(null, Date.now() + path.extname(file.originalname));
-    }
-})
-
-const ALLOWED_IMAGE_MIME_TYPES = ['image/jpeg', 'image/png'];
-const ALLOWED_VIDEO_MIME_TYPES = ['video/mp4', 'video/quicktime'];
-const ALLOWED_MIDIA_MIME_TYPES = [...ALLOWED_IMAGE_MIME_TYPES, ...ALLOWED_VIDEO_MIME_TYPES];
-
-const criarFiltroDeArquivo = (tiposPermitidos, mensagemErro) => (req, file, cb) => {
-    if (tiposPermitidos.includes(file.mimetype)) {
-        cb(null, true);
-    } else {
-        cb(new Error(`${mensagemErro}: ${file.mimetype}`), false);
-    }
-};
+const { uploadMidia } = require('../config/uploadConfig.js');
 
 // Teto do carrossel do Instagram — as outras plataformas rejeitam antes disso de qualquer forma
-// (TikTok/Linkedin nem aceitam carrossel nesta integração).
+// (TikTok/Linkedin nem aceitam carrossel de vídeo nesta integração).
 const MAX_CAROUSEL_ITEMS = 10;
-
-const uploadMidia = multer({
-    storage,
-    fileFilter: criarFiltroDeArquivo(ALLOWED_MIDIA_MIME_TYPES, 'Formato não suportado. Use JPEG, PNG, MP4 ou MOV'),
-    limits: { fileSize: 300 * 1024 * 1024 }
-});
 
 // Todas as rotas de mídia aceitam N arquivos no MESMO campo 'arquivo': 1 = post simples, 2+ =
 // carrossel. Não há rota separada pra carrossel — a contagem é o que distingue.

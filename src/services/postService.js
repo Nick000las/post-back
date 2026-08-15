@@ -1,107 +1,11 @@
 const prismaAdapter = require('../adapters/prismaAdapter.js');
 const AppError = require('../errors/AppError.js');
 const { publishQueue } = require('../queues/publishQueue.js');
-const kanbanService = require('./kanbanService.js');
-const thumbnailService = require('./thumbnailService.js');
+const schedulingHelpers = require('./schedulingHelpers.js');
 const { FIXED_COLUMN_KEYS } = require('../constants/kanban.js');
 const { FEED_STATUS_FILTER_MAP, FEED_DATE_FILTERS } = require('../constants/feed.js');
-const fs = require('fs');
-const path = require('path');
-
-const UPLOADS_DIR = '.uploads';
-const FORMATO_ISO_COM_FUSO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
 
 class PostService {
-
-    static #removerArquivoLocal (arquivo) {
-        if (fs.existsSync(arquivo.path)) {
-            fs.unlinkSync(arquivo.path);
-        }
-    }
-
-    // Apaga do disco o arquivo original e o thumbnail de cada item de mídia de um post. Ponto único
-    // usado por toda exclusão/substituição de mídia (excluirPost, excluirDraft, atualizarMidiaDraft,
-    // removerMidiaDraft) — antes isso era um par de ifs repetido em cada um, e com carrossel viraria
-    // um par de loops repetido. Tolera media undefined/vazio (post sem mídia é estado válido).
-    static #removerMidiaDoDisco (media = []) {
-        media.forEach(item => {
-            if (item.file_path) this.#removerArquivoLocal({ path: path.join(UPLOADS_DIR, item.file_path) });
-            if (item.thumbnail_path) this.#removerArquivoLocal({ path: path.join(UPLOADS_DIR, 'thumbs', item.thumbnail_path) });
-        });
-    }
-
-    // Converte os arquivos do multer (req.files) no shape que o adapter espera, gerando o thumbnail
-    // de cada um. A ordem do array é a ordem do carrossel. thumbnailService.gerar nunca lança (já
-    // devolve null em caso de falha), então um thumbnail quebrado não derruba o upload inteiro.
-    static async #montarMidiaItems (arquivos) {
-        return Promise.all(arquivos.map(async arquivo => ({
-            filePath: arquivo.filename,
-            fileName: arquivo.originalname,
-            fileType: arquivo.mimetype,
-            thumbnailPath: await thumbnailService.gerar(arquivo)
-        })));
-    }
-
-    // Confere que o client pertence ao usuário autenticado (agência) antes de liberar qualquer
-    // operação nas contas/posts desse client.
-    static async #validarCliente (clientId, userId) {
-        const cliente = await prismaAdapter.buscarClientePorId(clientId, userId);
-        if (!cliente) throw new AppError('Cliente não encontrado');
-        return cliente;
-    }
-
-    // Gancho de IA (Kanban): todo post criado passa por aqui pra decidir sua column_id. Se
-    // columnIdExplicito vier definido (futura rota de IA que já escolhe a coluna), usa ele; senão,
-    // cai por padrão na coluna "Rascunhos" do client. Este é o ÚNICO lugar que decide esse default —
-    // gerenciarPostagemEmLote/agendarPostagem/criarDraft chamam este método antes de criar o post.
-    static async #resolverColumnId (clientId, columnIdExplicito) {
-        if (columnIdExplicito !== undefined && columnIdExplicito !== null) {
-            return parseInt(columnIdExplicito);
-        }
-        return await kanbanService.resolverColunaIdeias(clientId);
-    }
-
-    // Salto automático de coluna no Kanban: quando um post muda pra um status "de fase" (agendado ou
-    // finalizado, nos dois sentidos do termo), ele pula pra coluna fixa correspondente, sem passar pela
-    // validação de kanbanService.moverPost (que só existe pra bloquear o usuário movendo manualmente —
-    // esse bloqueio não se aplica aqui, é o próprio sistema movendo). Silencioso por design: um post
-    // sem coluna fixa configurada (inconsistência de dados) não pode derrubar o fluxo de publicação.
-    static async #moverParaColunaFixa (postId, clientId, fixedKey) {
-        try {
-            const coluna = await prismaAdapter.buscarColunaPorFixedKey(clientId, fixedKey);
-            if (!coluna) return;
-            await prismaAdapter.moverPostDeColuna(postId, clientId, coluna.id);
-        } catch (erro) {
-            console.error('Falha ao mover post automaticamente de coluna', { postId, clientId, fixedKey, erro: erro.message });
-        }
-    }
-
-    // A tentativa de publicar em si (e o registro de sucesso/falha por conta) migrou pro worker
-    // (src/workers/publishWorker.js) — aqui só marcamos o post e enfileiramos.
-    // opts.delayMs: usado pelo agendamento (undefined = publica assim que possível).
-    // opts.statusInicial: 'PROCESSING' (padrão, publicação imediata) ou 'SCHEDULED' (aguardando o horário agendado).
-    static async #enfileirarContas (post, accountsList, clientId, opts = {}) {
-        const { delayMs, statusInicial = 'PROCESSING' } = opts;
-
-        await prismaAdapter.atualizarStatusPost(post.id, statusInicial);
-        if (statusInicial === 'SCHEDULED') {
-            await this.#moverParaColunaFixa(post.id, clientId, FIXED_COLUMN_KEYS.AGENDADO);
-        }
-
-        const jobOpts = delayMs ? { delay: delayMs } : {};
-        await Promise.all(accountsList.map(async account => {
-            const job = await publishQueue.add('publicar-conta', { postId: post.id, accountId: account.id, clientId }, jobOpts);
-            if (statusInicial === 'SCHEDULED') {
-                await prismaAdapter.registrarJobAgendado(post.id, account.id, job.id);
-            }
-        }));
-
-        return {
-            status: statusInicial === 'SCHEDULED' ? 'scheduled' : 'queued',
-            postId: post.id,
-            totalContas: accountsList.length
-        };
-    }
 
     // Resolve o filtro de data (query param, ex.: 'hoje'/'7dias'/'mes') pro intervalo [from, to] usado
     // nos where dos feeds. undefined quando não houver filtro (sem corte de data).
@@ -140,12 +44,6 @@ class PostService {
         return { from, to };
     }
 
-    static async #validarDataFutura(scheduledFor){
-        if (typeof scheduledFor !== 'string' || !FORMATO_ISO_COM_FUSO.test(scheduledFor)) {
-            throw new AppError('Data de agendamento inválida. Use ISO 8601 com fuso horário explícito (ex.: 2026-08-01T10:00:00-03:00).');
-        }
-    }
-
     // Chamado pelo worker depois de cada job (sucesso ou falha definitiva) pra fechar o status do post
     // quando todas as contas já tiverem sido processadas.
     static async finalizarStatusSeCompleto (postId) {
@@ -162,24 +60,24 @@ class PostService {
         // O worker só tem postId/accountId no job.data — precisa buscar o post pra saber o client_id
         // antes de conseguir resolver a coluna Finalizado desse client.
         const post = await prismaAdapter.buscarPostPorId(postId);
-        if (post) await this.#moverParaColunaFixa(postId, post.client_id, FIXED_COLUMN_KEYS.FINALIZADO);
+        if (post) await schedulingHelpers.moverParaColunaFixa(postId, post.client_id, FIXED_COLUMN_KEYS.FINALIZADO);
     }
 
     // arquivos: array de req.files (multer). 1 item = post simples, 2+ = carrossel — o backend não
     // trata os dois casos de forma diferente, só a contagem muda.
     static async gerenciarPostagemEmLote (arquivos, caption, accountsList, clientId, userId, columnIdExplicito) {
-        await this.#validarCliente(clientId, userId);
+        await schedulingHelpers.validarCliente(clientId, userId);
 
-        const columnId = await this.#resolverColumnId(clientId, columnIdExplicito);
-        const midiaItems = await this.#montarMidiaItems(arquivos);
+        const columnId = await schedulingHelpers.resolverColumnId(clientId, columnIdExplicito);
+        const midiaItems = await schedulingHelpers.montarMidiaItems(arquivos);
         const novoPost = await prismaAdapter.criarPost(caption, midiaItems, 'DRAFT', clientId, null, columnId);
 
-        return this.#enfileirarContas(novoPost, accountsList, clientId);
+        return schedulingHelpers.enfileirarContas(novoPost, accountsList, clientId);
     }
 
     static async agendarPostagem (arquivos, caption, accountsList, scheduledFor, clientId, userId, columnIdExplicito) {
-        await this.#validarCliente(clientId, userId);
-        await this.#validarDataFutura(scheduledFor);
+        await schedulingHelpers.validarCliente(clientId, userId);
+        schedulingHelpers.validarFormatoData(scheduledFor);
 
         const data = new Date(scheduledFor);
         const delayMs = data.getTime() - Date.now();
@@ -187,15 +85,15 @@ class PostService {
             throw new AppError('A data de agendamento precisa estar no futuro.');
         }
 
-        const columnId = await this.#resolverColumnId(clientId, columnIdExplicito);
-        const midiaItems = await this.#montarMidiaItems(arquivos);
+        const columnId = await schedulingHelpers.resolverColumnId(clientId, columnIdExplicito);
+        const midiaItems = await schedulingHelpers.montarMidiaItems(arquivos);
         const novoPost = await prismaAdapter.criarPost(caption, midiaItems, 'SCHEDULED', clientId, data, columnId);
 
-        return this.#enfileirarContas(novoPost, accountsList, clientId, { delayMs, statusInicial: 'SCHEDULED' });
+        return schedulingHelpers.enfileirarContas(novoPost, accountsList, clientId, { delayMs, statusInicial: 'SCHEDULED' });
     }
 
     static async consultarStatusPost (postId, clientId, userId) {
-        await this.#validarCliente(clientId, userId);
+        await schedulingHelpers.validarCliente(clientId, userId);
 
         const post = await prismaAdapter.buscarPostComStatusContas(postId, clientId);
         if (!post) throw new AppError('Post não encontrado');
@@ -206,7 +104,7 @@ class PostService {
     // Cancelar agendamento NÃO apaga o post — reverte pra DRAFT (arte/legenda preservadas) e move o
     // card de volta pra coluna Rascunhos, pra a agência poder reeditar/reagendar depois sem reupload.
     static async cancelarAgendamento (postId, clientId, userId) {
-        await this.#validarCliente(clientId, userId);
+        await schedulingHelpers.validarCliente(clientId, userId);
 
         const post = await prismaAdapter.buscarPostAgendadoComJobs(postId, clientId);
         if (!post) throw new AppError('Post agendado não encontrado ou já iniciado');
@@ -224,7 +122,7 @@ class PostService {
         const postRevertido = await prismaAdapter.reverterAgendamentoParaDraft(postId, clientId);
         if (!postRevertido) throw new AppError('Post agendado não encontrado ou já iniciado');
 
-        await this.#moverParaColunaFixa(postId, clientId, FIXED_COLUMN_KEYS.IDEIAS);
+        await schedulingHelpers.moverParaColunaFixa(postId, clientId, FIXED_COLUMN_KEYS.IDEIAS);
 
         return { message: 'Agendamento cancelado. O post voltou a ser um rascunho.', postId: postRevertido.id };
     }
@@ -234,8 +132,8 @@ class PostService {
     // reagendar os jobs já existentes na fila com o novo horário — mais barato e não perde o job_id
     // já registrado em post_accounts.
     static async alterarDataAgendamento (postId, clientId, userId, scheduledFor) {
-        await this.#validarCliente(clientId, userId);
-        await this.#validarDataFutura(scheduledFor);
+        await schedulingHelpers.validarCliente(clientId, userId);
+        schedulingHelpers.validarFormatoData(scheduledFor);
 
         const data = new Date(scheduledFor);
         const novoDelayMs = data.getTime() - Date.now();
@@ -266,7 +164,7 @@ class PostService {
     // estiver SCHEDULED com job(s) na fila, eles precisam ser removidos antes de excluir (mesmo cuidado
     // de cancelarAgendamento — um job 'delayed' órfão tentaria publicar um post que não existe mais).
     static async excluirPost (postId, clientId, userId) {
-        await this.#validarCliente(clientId, userId);
+        await schedulingHelpers.validarCliente(clientId, userId);
 
         // Só existe job pra remover se o post ainda estava SCHEDULED — null aqui é esperado (e não é
         // erro) pra draft/publicado/etc., que nunca tiveram job pendente na fila.
@@ -286,25 +184,25 @@ class PostService {
         const post = await prismaAdapter.excluirPostDefinitivo(postId, clientId);
         if (!post) throw new AppError('Post não encontrado');
 
-        this.#removerMidiaDoDisco(post.media);
+        await schedulingHelpers.removerMidiaDoDisco(post.media);
 
         return { message: 'Post excluído com sucesso', postId };
     }
 
     static async criarDraft (caption, arquivos, accountIds, clientId, userId, columnIdExplicito) {
-        await this.#validarCliente(clientId, userId);
+        await schedulingHelpers.validarCliente(clientId, userId);
 
         if (!Array.isArray(accountIds) || accountIds.length === 0) {
             throw new AppError('Selecione ao menos uma conta para o rascunho');
         }
 
-        const columnId = await this.#resolverColumnId(clientId, columnIdExplicito);
-        const midiaItems = await this.#montarMidiaItems(arquivos);
+        const columnId = await schedulingHelpers.resolverColumnId(clientId, columnIdExplicito);
+        const midiaItems = await schedulingHelpers.montarMidiaItems(arquivos);
         return prismaAdapter.criarDraftComContas(caption, midiaItems, clientId, accountIds, columnId);
     }
 
     static async publicarDraft (draftId, clientId, userId) {
-        await this.#validarCliente(clientId, userId);
+        await schedulingHelpers.validarCliente(clientId, userId);
 
         const draft = await prismaAdapter.buscarDraftPorId(draftId, clientId);
         if (!draft) throw new AppError('Draft não encontrado');
@@ -313,15 +211,15 @@ class PostService {
         const contasVinculadas = await prismaAdapter.listarContasDoDraft(draftId, clientId);
         if (contasVinculadas.length === 0) throw new AppError('Este rascunho não possui contas vinculadas');
 
-        return this.#enfileirarContas(draft, contasVinculadas, clientId);
+        return schedulingHelpers.enfileirarContas(draft, contasVinculadas, clientId);
     }
 
     // Análogo de publicarDraft, mas agendando em vez de publicar imediatamente. Existe pra permitir
     // agendar um post que já está no Kanban (ex.: card em "Rascunhos") sem duplicar o post nem reenviar o
     // arquivo — ao contrário de agendarPostagem (multipart, sempre cria um post novo).
     static async agendarDraft (draftId, clientId, userId, scheduledFor) {
-        await this.#validarCliente(clientId, userId);
-        await this.#validarDataFutura(scheduledFor);
+        await schedulingHelpers.validarCliente(clientId, userId);
+        schedulingHelpers.validarFormatoData(scheduledFor);
 
 
         const data = new Date(scheduledFor);
@@ -340,11 +238,11 @@ class PostService {
 
         await prismaAdapter.atualizarScheduledFor(draftId, data);
 
-        return this.#enfileirarContas(draft, contasVinculadas, clientId, { delayMs, statusInicial: 'SCHEDULED' });
+        return schedulingHelpers.enfileirarContas(draft, contasVinculadas, clientId, { delayMs, statusInicial: 'SCHEDULED' });
     }
 
     static async atualizarDraft (draftId, caption, clientId, userId) {
-        await this.#validarCliente(clientId, userId);
+        await schedulingHelpers.validarCliente(clientId, userId);
 
         const draftAtualizado = await prismaAdapter.atualizarDraft(draftId, caption, clientId);
         if (!draftAtualizado) throw new AppError('Draft não encontrado');
@@ -355,15 +253,15 @@ class PostService {
     // conjunto novo troca o antigo por inteiro, não soma. arquivos vem de req.files (multer), já
     // salvos em disco pelo controller antes de chegar aqui.
     static async atualizarMidiaDraft (draftId, clientId, userId, arquivos) {
-        await this.#validarCliente(clientId, userId);
+        await schedulingHelpers.validarCliente(clientId, userId);
         const draftAtual = await prismaAdapter.buscarDraftPorId(draftId, clientId);
         if (!draftAtual) throw new AppError('Draft não encontrado');
 
-        const midiaItems = await this.#montarMidiaItems(arquivos);
+        const midiaItems = await schedulingHelpers.montarMidiaItems(arquivos);
         const draftAtualizado = await prismaAdapter.substituirMidiaDoPost(draftId, clientId, midiaItems);
         if (!draftAtualizado) throw new AppError('Draft não encontrado');
 
-        this.#removerMidiaDoDisco(draftAtual.media);
+        await schedulingHelpers.removerMidiaDoDisco(draftAtual.media);
         return draftAtualizado;
     }
 
@@ -371,14 +269,14 @@ class PostService {
     // usuário anexar outro (ou publicar/agendar, o que passa a ser bloqueado enquanto estiver vazio).
     // Substituir por conjunto vazio é exatamente "remover tudo", por isso reusa substituirMidiaDoPost.
     static async removerMidiaDraft (draftId, clientId, userId) {
-        await this.#validarCliente(clientId, userId);
+        await schedulingHelpers.validarCliente(clientId, userId);
         const draftAtual = await prismaAdapter.buscarDraftPorId(draftId, clientId);
         if (!draftAtual) throw new AppError('Draft não encontrado');
 
         const draftAtualizado = await prismaAdapter.substituirMidiaDoPost(draftId, clientId, []);
         if (!draftAtualizado) throw new AppError('Draft não encontrado');
 
-        this.#removerMidiaDoDisco(draftAtual.media);
+        await schedulingHelpers.removerMidiaDoDisco(draftAtual.media);
         return draftAtualizado;
     }
 
@@ -387,17 +285,17 @@ class PostService {
     // atualizado em vez de montar a resposta à mão, pra bater exatamente com o shape que o
     // frontend já espera de qualquer outra leitura de draft.
     static async removerItemDeMidia (draftId, mediaId, clientId, userId) {
-        await this.#validarCliente(clientId, userId);
+        await schedulingHelpers.validarCliente(clientId, userId);
 
         const itemRemovido = await prismaAdapter.removerItemDeMidia(mediaId, draftId, clientId);
         if (!itemRemovido) throw new AppError('Mídia não encontrada neste draft');
 
-        this.#removerMidiaDoDisco([itemRemovido]);
+        await schedulingHelpers.removerMidiaDoDisco([itemRemovido]);
         return prismaAdapter.buscarDraftPorId(draftId, clientId);
     }
 
     static async buscarDraft (draftId, clientId, userId) {
-        await this.#validarCliente(clientId, userId);
+        await schedulingHelpers.validarCliente(clientId, userId);
 
         const draft = await prismaAdapter.buscarDraftComContas(draftId, clientId);
         if (!draft) throw new AppError('Draft não encontrado');
@@ -405,26 +303,26 @@ class PostService {
     }
 
     static async listarDrafts (clientId, userId) {
-        await this.#validarCliente(clientId, userId);
+        await schedulingHelpers.validarCliente(clientId, userId);
 
         const drafts = await prismaAdapter.listarDrafts(clientId);
         return drafts;
     }
 
     static async excluirDraft (draftId, clientId, userId) {
-        await this.#validarCliente(clientId, userId);
+        await schedulingHelpers.validarCliente(clientId, userId);
 
         const draft = await prismaAdapter.excluirDraft(draftId, clientId);
         if (!draft) throw new AppError('Draft não encontrado');
 
-        this.#removerMidiaDoDisco(draft.media);
+        await schedulingHelpers.removerMidiaDoDisco(draft.media);
         return draft;
     }
 
     // Feed Global ("torre de controle"): cross-client, escopado ao usuário autenticado. filtros:
     // { status, clientId?, date? } — status já validado/default no controller (#parseFiltrosFeedGlobal).
     static async listarFeedGlobal (userId, filtros, page, limit) {
-        if (filtros.clientId) await this.#validarCliente(filtros.clientId, userId);
+        if (filtros.clientId) await schedulingHelpers.validarCliente(filtros.clientId, userId);
 
         const statusList = FEED_STATUS_FILTER_MAP[filtros.status];
         const intervalo = this.#resolverIntervaloData(filtros.date);
@@ -447,7 +345,7 @@ class PostService {
     // Feed do Cliente ("vitrine/portfólio"): sempre de um único client. filtros:
     // { clientId, platform?, month?, year? } — clientId é obrigatório (garantido no controller).
     static async listarFeedCliente (userId, filtros, page, limit) {
-        await this.#validarCliente(filtros.clientId, userId);
+        await schedulingHelpers.validarCliente(filtros.clientId, userId);
 
         const intervalo = this.#resolverIntervaloMesAno(filtros.month, filtros.year);
 
@@ -473,7 +371,7 @@ class PostService {
     //   3. resetar delivery_status/error_message pra PENDING nas contas relevantes;
     //   4. reaproveitar o padrão de #enfileirarContas (publishQueue.add) pra re-enfileirar.
     static async republicarPost (postId, clientId, userId) {
-        await this.#validarCliente(clientId, userId);
+        await schedulingHelpers.validarCliente(clientId, userId);
 
         const post = await prismaAdapter.buscarPostComStatusContas(postId, clientId);
         if (!post) throw new AppError('Post não encontrado');
@@ -485,7 +383,7 @@ class PostService {
             prismaAdapter.vincularPostConta(postId, account.accountId, 'PENDING', null, null)
         ));
 
-        return this.#enfileirarContas(
+        return schedulingHelpers.enfileirarContas(
             post,
             contasFailed.map(account => ({ id: account.accountId })),
             clientId
@@ -497,7 +395,7 @@ class PostService {
     // soma às existentes) — decisão consistente com o formulário de seleção de contas ser um
     // multi-select que reflete o estado final desejado, igual a qualquer outro formulário de edição.
     static async vincularContasAoDraft (draftId, clientId, userId, accountIds) {
-        await this.#validarCliente(clientId, userId);
+        await schedulingHelpers.validarCliente(clientId, userId);
 
         const draft = await prismaAdapter.buscarDraftPorId(draftId, clientId);
         if (!draft) throw new AppError('Draft não encontrado');

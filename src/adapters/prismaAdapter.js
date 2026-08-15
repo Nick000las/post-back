@@ -31,6 +31,9 @@ const POST_SELECT_BASE = {
     published_at: true,
     suggested_date: true,
     format: true,
+    // Null na esmagadora maioria dos posts — só preenchido em ocorrências de uma série recorrente
+    // de Story. O frontend usa pra marcar o card como "faz parte de uma série".
+    recurrence_id: true,
     post_media: { orderBy: { order: 'asc' } }
 };
 
@@ -275,19 +278,110 @@ class PrismaAdapter {
 
     // midiaItems: [{ filePath, fileName, fileType, thumbnailPath }] na ordem de exibição do
     // carrossel — o índice do array vira o `order`. Array vazio é válido (post sem mídia).
-    static async criarPost(caption, midiaItems, status, clientId, scheduledFor = null, columnId = null) {
+    // opts: { format, recurrenceId } — usados só pelo fluxo de Stories (storyService). O fluxo de
+    // FEED não passa nenhum dos dois, e continua gravando null nos dois campos como sempre.
+    static async criarPost(caption, midiaItems, status, clientId, scheduledFor = null, columnId = null, opts = {}) {
+        const { format = null, recurrenceId = null } = opts;
+
         const post = await prisma.posts.create({
             data: {
                 caption,
                 status,
+                format,
                 client_id: parseInt(clientId),
                 scheduled_for: scheduledFor,
                 column_id: columnId,
+                // parseInt aqui porque recurrenceId pode chegar como string de req.params
+                // (estenderSerie) ou já como Int vindo de criarRegraRecorrencia — o Prisma recusa
+                // string num campo Int.
+                recurrence_id: recurrenceId === null || recurrenceId === undefined ? null : parseInt(recurrenceId),
                 post_media: { create: PrismaAdapter.#montarMidiaParaCriacao(midiaItems) }
             },
             select: POST_SELECT_BASE
         });
         return PrismaAdapter.#comMidia(post);
+    }
+
+    // Só o grupo — as datas em si vivem em cada post (scheduled_for), não aqui. Ver comentário do
+    // model post_recurrences.
+    static async criarRegraRecorrencia(clientId) {
+        return await prisma.post_recurrences.create({
+            data: { client_id: parseInt(clientId) }
+        });
+    }
+
+    // posts.recurrence_id é onDelete: SetNull, não Cascade — apagar o grupo aqui NÃO apaga as
+    // ocorrências. Só chamar depois de já ter excluído todos os posts da série (ver
+    // storyService.excluirSerie), senão elas ficam órfãs (recurrence_id vira null sozinho, mas os
+    // posts continuam existindo).
+    static async excluirRegraRecorrencia(recurrenceId, clientId) {
+        const resultado = await prisma.post_recurrences.deleteMany({
+            where: { id: parseInt(recurrenceId), client_id: parseInt(clientId) }
+        });
+        return resultado.count > 0;
+    }
+
+    // Quantos post_media (de QUALQUER post) ainda apontam pro mesmo arquivo físico. Existe porque
+    // Stories de uma série reaproveitam o MESMO arquivo em disco entre ocorrências (mesma mídia,
+    // clonada por string em vez de reupload — ver storyService#midiaExistenteParaCriacao), então
+    // apagar o post_media de UMA ocorrência não significa que o arquivo em disco ficou órfão: outra
+    // ocorrência (draft sobrevivente de um cancelamento em colapso, ou uma já PUBLISHED/FAILED
+    // preservada) pode continuar precisando dele. schedulingHelpers#removerMidiaDoDisco só apaga do
+    // disco quando essa contagem vier zero.
+    static async contarUsosDeArquivo(filePath) {
+        return await prisma.post_media.count({ where: { file_path: filePath } });
+    }
+
+    static async contarUsosDeThumbnail(thumbnailPath) {
+        return await prisma.post_media.count({ where: { thumbnail_path: thumbnailPath } });
+    }
+
+    // Todas as ocorrências de uma série, em ordem cronológica (mais antiga primeiro). Sempre
+    // filtra por clientId também (não só recurrenceId) — sem isso um id de série de outro client
+    // vazaria dados.
+    static async listarPostsPorRecorrencia(recurrenceId, clientId) {
+        return await prisma.posts.findMany({
+            where: { recurrence_id: parseInt(recurrenceId), client_id: parseInt(clientId) },
+            select: { id: true, status: true, scheduled_for: true, published_at: true },
+            orderBy: { scheduled_for: 'asc' }
+        });
+    }
+
+    // Uma série por linha, com o total de ocorrências, a data da próxima ainda SCHEDULED (null se
+    // não houver nenhuma futura) e uma thumbnail representativa — pra tela de índice não precisar
+    // de N chamadas extras.
+    static async listarSeriesDoCliente(clientId) {
+        const series = await prisma.post_recurrences.findMany({
+            where: { client_id: parseInt(clientId) },
+            include: {
+                posts: {
+                    select: {
+                        status: true,
+                        scheduled_for: true,
+                        post_media: { select: { file_path: true, thumbnail_path: true }, orderBy: { order: 'asc' }, take: 1 }
+                    },
+                    orderBy: { scheduled_for: 'asc' }
+                }
+            },
+            orderBy: { created_at: 'desc' }
+        });
+
+        return series.map(({ posts, ...serie }) => {
+            // Toda ocorrência da série usa a MESMA mídia (agendarStory/estenderSerie reaproveitam o
+            // mesmo midiaItems) — pega a primeira que tiver, não interessa qual.
+            const midia = posts.find(post => post.post_media.length > 0)?.post_media[0] ?? null;
+
+            return {
+                ...serie,
+                totalOcorrencias: posts.length,
+                proximaOcorrencia: posts
+                    .filter(post => post.status === 'SCHEDULED')
+                    .map(post => post.scheduled_for)
+                    .sort((a, b) => a - b)[0] ?? null,
+                thumbnailPath: midia?.thumbnail_path ?? null,
+                filePath: midia?.file_path ?? null
+            };
+        });
     }
 
     // Traduz o shape camelCase que os services usam pro snake_case da tabela, atribuindo o `order`
@@ -397,12 +491,15 @@ class PrismaAdapter {
         return conta;
     }
 
-    static async criarDraftComContas(caption, midiaItems, clientId, accountIds, columnId = null) {
+    static async criarDraftComContas(caption, midiaItems, clientId, accountIds, columnId = null, opts = {}) {
+        const { format = null } = opts;
+
         return await prisma.$transaction(async (tx) => {
             const draft = await tx.posts.create({
                 data: {
                     caption,
                     status: 'DRAFT',
+                    format,
                     client_id: parseInt(clientId),
                     column_id: columnId,
                     post_media: { create: PrismaAdapter.#montarMidiaParaCriacao(midiaItems) }
@@ -428,6 +525,16 @@ class PrismaAdapter {
             select: POST_SELECT_BASE
         });
         return draft && PrismaAdapter.#comMidia(draft);
+    }
+
+    // Mesma query de buscarDraftPorId, sem o filtro de status — único jeito de ler um Story depois
+    // que ele sai de DRAFT (agendado/publicado/etc.).
+    static async buscarPostDetalhado(postId, clientId) {
+        const post = await prisma.posts.findFirst({
+            where: { id: parseInt(postId), client_id: parseInt(clientId) },
+            select: POST_SELECT_BASE
+        });
+        return post && PrismaAdapter.#comMidia(post);
     }
 
     // Consumido pelo worker (publishWorker) e repassado direto pros adapters de plataforma, que
@@ -515,11 +622,13 @@ class PrismaAdapter {
 
     // Cancelar agendamento não apaga mais o post — reverte pra DRAFT (arte/legenda preservadas), pra
     // a agência poder reagendar depois sem refazer o upload. Retorna null se não achar um SCHEDULED
-    // com esse id+client (mesma regra de posse de sempre).
+    // com esse id+client (mesma regra de posse de sempre). recurrence_id sempre zera junto: um
+    // rascunho nunca deveria carregar vínculo de série — sem isso ele continuaria aparecendo como
+    // ocorrência de uma série da qual não faz mais parte.
     static async reverterAgendamentoParaDraft(postId, clientId) {
         const resultado = await prisma.posts.updateMany({
             where: { id: parseInt(postId), client_id: parseInt(clientId), status: 'SCHEDULED' },
-            data: { status: 'DRAFT', scheduled_for: null, updated_at: new Date() }
+            data: { status: 'DRAFT', scheduled_for: null, recurrence_id: null, updated_at: new Date() }
         });
         if (resultado.count === 0) return null;
         const post = await prisma.posts.findUnique({ where: { id: parseInt(postId) }, select: POST_SELECT_BASE });

@@ -3,32 +3,9 @@ const kanbanService = require('../services/kanbanService.js');
 const AppError = require('../errors/AppError.js');
 const { responderComErro } = require('../utils/httpErrorHandler.js');
 const { FEED_STATUS_FILTERS, FEED_DATE_FILTERS, PLATAFORMAS_VALIDAS } = require('../constants/feed.js');
-const fs = require('fs');
+const { parseAccounts, limparArquivosEnviados } = require('../utils/uploadRequest.js');
 
 class PostController {
-
-    static #parseAccounts (rawAccounts) {
-        let accounts;
-        try {
-            accounts = JSON.parse(rawAccounts);
-        } catch {
-            throw new AppError('Lista de contas inválida');
-        }
-
-        if(!Array.isArray(accounts) || accounts.length === 0) throw new AppError('Nenhuma conta selecionada');
-        if(!accounts.every(account => Number.isInteger(account?.id))) throw new AppError('Cada conta deve ter um id numérico');
-
-        return accounts;
-    }
-
-    // O multer já gravou os arquivos em disco antes do handler rodar — se a requisição falhar
-    // depois disso, eles viram lixo órfão em .uploads. Ponto único de limpeza usado por todo
-    // handler de upload (aceita undefined: rota sem arquivo nenhum é caso válido).
-    static #limparArquivosEnviados (arquivos = []) {
-        arquivos.forEach(arquivo => {
-            if (fs.existsSync(arquivo.path)) fs.unlinkSync(arquivo.path);
-        });
-    }
 
     static #parsePaginacao (query) {
         const PAGE_PADRAO = 1;
@@ -82,20 +59,20 @@ class PostController {
 
             if (!arquivos?.length) throw new AppError('Nenhum arquivo enviado');
 
-            const accounts = PostController.#parseAccounts(req.body.accounts);
+            const accounts = parseAccounts(req.body.accounts);
 
             try {
                 const resultado = await postService.gerenciarPostagemEmLote(arquivos, caption, accounts, clientId, req.user.id);
                 return res.status(202).json({ message: 'Postagem em lote recebida e em processamento', detalhes: resultado });
             } catch (erroInterno) {
-                PostController.#limparArquivosEnviados(arquivos);
+                limparArquivosEnviados(arquivos);
                 return responderComErro(res, erroInterno, {
                     logContext: 'Erro inesperado ao processar postagem em lote:',
                     mensagemPadrao: 'Erro ao processar a postagem em lote'
                 });
             }
         } catch (error) {
-            PostController.#limparArquivosEnviados(arquivos);
+            limparArquivosEnviados(arquivos);
             return responderComErro(res, error, {
                 logContext: 'Erro ao validar postagem em lote:',
                 mensagemPadrao: 'Erro ao processar a postagem em lote'
@@ -111,20 +88,20 @@ class PostController {
 
             if (!arquivos?.length) throw new AppError('Nenhum arquivo enviado');
 
-            const accounts = PostController.#parseAccounts(req.body.accounts);
+            const accounts = parseAccounts(req.body.accounts);
 
             try {
                 const resultado = await postService.agendarPostagem(arquivos, caption, accounts, scheduled_for, clientId, req.user.id);
                 return res.status(202).json({ message: 'Postagem agendada com sucesso', detalhes: resultado });
             } catch (erroInterno) {
-                PostController.#limparArquivosEnviados(arquivos);
+                limparArquivosEnviados(arquivos);
                 return responderComErro(res, erroInterno, {
                     logContext: 'Erro inesperado ao agendar postagem:',
                     mensagemPadrao: 'Erro ao agendar a postagem'
                 });
             }
         } catch (error) {
-            PostController.#limparArquivosEnviados(arquivos);
+            limparArquivosEnviados(arquivos);
             return responderComErro(res, error, {
                 logContext: 'Erro ao validar agendamento de postagem:',
                 mensagemPadrao: 'Erro ao processar o agendamento'
@@ -216,12 +193,12 @@ class PostController {
 
             if (!arquivos?.length) throw new AppError('Nenhum arquivo enviado');
 
-            const accounts = PostController.#parseAccounts(req.body.accounts);
+            const accounts = parseAccounts(req.body.accounts);
 
             const draft = await postService.criarDraft(caption, arquivos, accounts.map(conta => conta.id), clientId, req.user.id);
             return res.status(201).json({ message: 'Draft salvo com sucesso', postId: draft.id });
         } catch (error) {
-            PostController.#limparArquivosEnviados(arquivos);
+            limparArquivosEnviados(arquivos);
             return responderComErro(res, error, {
                 logContext: 'Erro ao salvar draft:',
                 mensagemPadrao: 'Erro ao salvar o draft'
@@ -286,7 +263,7 @@ class PostController {
             const draftAtualizado = await postService.atualizarMidiaDraft(id, clientId, req.user.id, arquivos);
             return res.status(200).json({ message: 'Mídia atualizada com sucesso', draft: draftAtualizado });
         } catch (error) {
-            PostController.#limparArquivosEnviados(arquivos);
+            limparArquivosEnviados(arquivos);
             return responderComErro(res, error, {
                 logContext: 'Erro ao atualizar mídia do draft:',
                 mensagemPadrao: 'Erro ao atualizar a mídia'
