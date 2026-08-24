@@ -6,13 +6,13 @@ const thumbnailService = require('./thumbnailService.js');
 const { FIXED_COLUMN_KEYS } = require('../constants/kanban.js');
 const fs = require('fs');
 const path = require('path');
+const { UPLOADS_DIR } = require('../config/uploadConfig.js');
 
 // Peças compartilhadas entre postService (FEED/carrossel) e storyService (Stories): validação de
 // posse, resolução de coluna do Kanban, geração de mídia e enfileiramento na fila de publicação.
 // Extraído de PostService (onde eram métodos privados, inacessíveis de fora) sem mudança de
 // comportamento — os dois fluxos precisam exatamente da mesma lógica pra criar um post agendado.
 
-const UPLOADS_DIR = '.uploads';
 const FORMATO_ISO_COM_FUSO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
 
 function removerArquivoLocal (arquivo) {

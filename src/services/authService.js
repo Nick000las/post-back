@@ -3,6 +3,12 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const AppError = require('../errors/AppError.js');
 
+// Hash de custo idêntico ao usado em registrar() (bcrypt.hash(senha, 10)), comparado quando o
+// e-mail não existe — sem isso, login com e-mail desconhecido responde mais rápido (pula o
+// bcrypt.compare) do que login com senha errada, um timing side-channel que permite enumerar
+// e-mails cadastrados testando contra /login.
+const DUMMY_HASH = bcrypt.hashSync('senha-fixa-so-para-normalizar-o-tempo-de-resposta', 10);
+
 class AuthService {
 
     static async registrar(name, email, password) {
@@ -20,12 +26,13 @@ class AuthService {
         };
     }
 
+    // Mensagem e caminho de execução uniformes entre "e-mail não existe" e "senha errada": evita
+    // que a API sirva de oráculo pra enumerar e-mails cadastrados (nem pela mensagem, nem pelo
+    // tempo de resposta — ver DUMMY_HASH acima).
     static async login(email, password) {
         const usuario = await prismaAdapter.buscarUsuarioPorEmail(email);
-        if (!usuario) throw new AppError('Usuário não encontrado');
-
-        const senhaValida = await bcrypt.compare(password, usuario.password_hash);
-        if (!senhaValida) throw new AppError('Senha inválida');
+        const senhaValida = await bcrypt.compare(password, usuario?.password_hash ?? DUMMY_HASH);
+        if (!usuario || !senhaValida) throw new AppError('E-mail ou senha inválidos');
 
         const token = jwt.sign({ id: usuario.id, email: usuario.email }, process.env.JWT_SECRET, { expiresIn: '1h' });
 

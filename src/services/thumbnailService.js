@@ -3,10 +3,10 @@ const fs = require('fs');
 const sharp = require('sharp');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
+const { UPLOADS_DIR } = require('../config/uploadConfig.js');
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 
-const UPLOADS_DIR = path.join(__dirname, '..', '..', '.uploads');
 const THUMBS_DIR = path.join(UPLOADS_DIR, 'thumbs');
 const THUMB_WIDTH = 400;
 

@@ -1,9 +1,19 @@
 const fs = require('fs');
 const path = require('path');
 const AppError = require('../errors/AppError.js');
+const { UPLOADS_DIR } = require('../config/uploadConfig.js');
 
-const UPLOADS_DIR = '.uploads';
 const TIKTOK_INIT_URL = 'https://open.tiktokapis.com/v2/post/publish/video/init/';
+// A Content Posting API exige o vídeo inteiro num chunk só (chunk_size = video_size,
+// total_chunk_count = 1) SÓ quando ele cabe dentro do teto documentado por chunk (64MB) — acima
+// disso, precisa dividir em N chunks de tamanho fixo dentro da faixa aceita (5–64MB), com o último
+// chunk carregando o resto. uploadConfig.js aceita mídia de até 300MB, então sem isso qualquer
+// vídeo grande seria enviado como um único PUT que a API rejeitaria.
+// ALERTA: os limites exatos vêm da documentação pública da Content Posting API — não foram
+// validados contra uma conta real (sem acesso ao TikTok neste projeto no momento). Se a publicação
+// de um vídeo grande falhar, este é o primeiro lugar a conferir.
+const TIKTOK_MAX_CHUNK_BYTES = 64 * 1024 * 1024;
+const TIKTOK_CHUNK_BYTES = 10 * 1024 * 1024;
 
 class TiktokAdapter {
     static async publicarContainer (post, accessToken, tiktokAccountId) {
@@ -80,15 +90,26 @@ class TiktokAdapter {
     static async #publicarVideo (post, midia, accessToken) {
         const caminhoCompleto = path.join(UPLOADS_DIR, midia.file_path);
         const { size: tamanhoArquivo } = fs.statSync(caminhoCompleto);
+        const { chunkSize, totalChunkCount } = this.#calcularPlanoDeChunks(tamanhoArquivo);
 
-        const initData = await this.#inicializarUpload(post, accessToken, tamanhoArquivo);
+        const initData = await this.#inicializarUpload(post, accessToken, tamanhoArquivo, chunkSize, totalChunkCount);
 
-        await this.#enviarArquivoBinario(caminhoCompleto, initData.upload_url, midia.file_type, tamanhoArquivo);
+        await this.#enviarArquivoBinario(caminhoCompleto, initData.upload_url, midia.file_type, tamanhoArquivo, chunkSize, totalChunkCount);
 
         return { success: true, externalId: initData.publish_id };
     }
 
-    static async #inicializarUpload (post, accessToken, tamanhoArquivo) {
+    // Vídeo que cabe no teto de um chunk só vai inteiro de uma vez (chunk_size = video_size,
+    // mesma matemática de sempre); acima disso, divide em chunks fixos de TIKTOK_CHUNK_BYTES —
+    // todos do mesmo tamanho, exceto o último, que carrega só o resto.
+    static #calcularPlanoDeChunks (tamanhoArquivo) {
+        if (tamanhoArquivo <= TIKTOK_MAX_CHUNK_BYTES) {
+            return { chunkSize: tamanhoArquivo, totalChunkCount: 1 };
+        }
+        return { chunkSize: TIKTOK_CHUNK_BYTES, totalChunkCount: Math.ceil(tamanhoArquivo / TIKTOK_CHUNK_BYTES) };
+    }
+
+    static async #inicializarUpload (post, accessToken, tamanhoArquivo, chunkSize, totalChunkCount) {
         const body = {
             post_info: {
                 title: post.caption,
@@ -100,8 +121,8 @@ class TiktokAdapter {
             source_info: {
                 source: 'FILE_UPLOAD',
                 video_size: tamanhoArquivo,
-                chunk_size: tamanhoArquivo,
-                total_chunk_count: 1
+                chunk_size: chunkSize,
+                total_chunk_count: totalChunkCount
             }
         };
 
@@ -125,21 +146,29 @@ class TiktokAdapter {
         return data.data;
     }
 
-    static async #enviarArquivoBinario (caminhoCompleto, uploadUrl, fileType, tamanhoArquivo) {
+    // Sequencial de propósito: o protocolo do TikTok manda todos os chunks pra MESMA upload_url,
+    // em ordem — mandar em paralelo arriscaria a API receber fora de ordem. Pára no primeiro chunk
+    // que falhar (não faz sentido continuar enviando o resto de um upload que já foi rejeitado).
+    static async #enviarArquivoBinario (caminhoCompleto, uploadUrl, fileType, tamanhoArquivo, chunkSize, totalChunkCount) {
         const fileBuffer = fs.readFileSync(caminhoCompleto);
 
-        const response = await fetch(uploadUrl, {
-            method: 'PUT',
-            headers: {
-                'Content-Type': fileType,
-                'Content-Range': `bytes 0-${tamanhoArquivo - 1}/${tamanhoArquivo}`
-            },
-            body: fileBuffer
-        });
+        for (let indice = 0; indice < totalChunkCount; indice++) {
+            const inicio = indice * chunkSize;
+            const fim = Math.min(inicio + chunkSize, tamanhoArquivo);
 
-        if (!response.ok) {
-            console.error('Erro no upload binário para o TikTok', { httpStatus: response.status });
-            throw new AppError('Falha ao enviar os dados do vídeo para o TikTok.');
+            const response = await fetch(uploadUrl, {
+                method: 'PUT',
+                headers: {
+                    'Content-Type': fileType,
+                    'Content-Range': `bytes ${inicio}-${fim - 1}/${tamanhoArquivo}`
+                },
+                body: fileBuffer.subarray(inicio, fim)
+            });
+
+            if (!response.ok) {
+                console.error('Erro no upload binário para o TikTok', { httpStatus: response.status, chunk: indice + 1, totalChunkCount });
+                throw new AppError(`Falha ao enviar os dados do vídeo para o TikTok (chunk ${indice + 1}/${totalChunkCount}).`);
+            }
         }
     }
 }

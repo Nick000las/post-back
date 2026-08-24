@@ -52,6 +52,7 @@ const { publishQueue } = require('../queues/publishQueue.js');
 const thumbnailService = require('./thumbnailService.js');
 const postService = require('./postService.js');
 const AppError = require('../errors/AppError.js');
+const { UPLOADS_DIR } = require('../config/uploadConfig.js');
 
 const CLIENT_ID = 99;
 const USER_ID = 7;
@@ -425,8 +426,8 @@ describe('PostService', () => {
 
             await postService.excluirPost(3, CLIENT_ID, USER_ID);
 
-            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join('.uploads', 'bar.jpg'));
-            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join('.uploads', 'thumbs', 'bar-thumb.jpg'));
+            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join(UPLOADS_DIR, 'bar.jpg'));
+            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join(UPLOADS_DIR, 'thumbs', 'bar-thumb.jpg'));
         });
 
         test('carrossel: remove do disco o arquivo e o thumbnail de TODOS os itens', async () => {
@@ -443,8 +444,8 @@ describe('PostService', () => {
             await postService.excluirPost(3, CLIENT_ID, USER_ID);
 
             expect(fs.unlinkSync).toHaveBeenCalledTimes(4);
-            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join('.uploads', 'b.jpg'));
-            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join('.uploads', 'thumbs', 'b-thumb.jpg'));
+            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join(UPLOADS_DIR, 'b.jpg'));
+            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join(UPLOADS_DIR, 'thumbs', 'b-thumb.jpg'));
         });
 
         test('não apaga do disco um arquivo ainda referenciado por outra ocorrência da mesma série de Story', async () => {
@@ -633,8 +634,8 @@ describe('PostService', () => {
             await postService.atualizarMidiaDraft(5, CLIENT_ID, USER_ID, arquivos);
 
             expect(fs.unlinkSync).toHaveBeenCalledTimes(4);
-            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join('.uploads', 'b.jpg'));
-            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join('.uploads', 'thumbs', 'b-thumb.jpg'));
+            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join(UPLOADS_DIR, 'b.jpg'));
+            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join(UPLOADS_DIR, 'thumbs', 'b-thumb.jpg'));
         });
     });
 
@@ -692,9 +693,9 @@ describe('PostService', () => {
             const resultado = await postService.removerItemDeMidia(5, 1, CLIENT_ID, USER_ID);
 
             expect(prismaAdapter.removerItemDeMidia).toHaveBeenCalledWith(1, 5, CLIENT_ID);
-            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join('.uploads', 'b.jpg'));
-            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join('.uploads', 'thumbs', 'b-thumb.jpg'));
-            expect(fs.unlinkSync).not.toHaveBeenCalledWith(path.join('.uploads', 'a.jpg'));
+            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join(UPLOADS_DIR, 'b.jpg'));
+            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join(UPLOADS_DIR, 'thumbs', 'b-thumb.jpg'));
+            expect(fs.unlinkSync).not.toHaveBeenCalledWith(path.join(UPLOADS_DIR, 'a.jpg'));
             expect(resultado.media).toEqual([{ file_path: 'a.jpg', thumbnail_path: 'a-thumb.jpg' }]);
         });
     });
@@ -715,8 +716,8 @@ describe('PostService', () => {
 
             await postService.excluirDraft(5, CLIENT_ID, USER_ID);
 
-            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join('.uploads', 'antigo.jpg'));
-            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join('.uploads', 'thumbs', 'antigo-thumb.jpg'));
+            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join(UPLOADS_DIR, 'antigo.jpg'));
+            expect(fs.unlinkSync).toHaveBeenCalledWith(path.join(UPLOADS_DIR, 'thumbs', 'antigo-thumb.jpg'));
         });
 
         test('não tenta remover arquivos quando o draft não tem mídia', async () => {

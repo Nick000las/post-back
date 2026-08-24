@@ -5,9 +5,11 @@ const path = require('path');
 const fs = require('fs');
 const commentController = require('../controllers/commentController.js');
 const authMiddleware = require('../middlewares/authMiddleware.js');
+const AppError = require('../errors/AppError.js');
+const { UPLOADS_DIR } = require('../config/uploadConfig.js');
 
 // Pasta separada de posts (mesmo nível de .uploads/thumbs/) — anexos de chat não são "mídia de post".
-const ATTACHMENTS_DIR = '.uploads/comment-attachments';
+const ATTACHMENTS_DIR = path.join(UPLOADS_DIR, 'comment-attachments');
 
 const storage = multer.diskStorage({
     destination: (req, file, cb) => {
@@ -30,7 +32,9 @@ const ALLOWED_ATTACHMENT_MIME_TYPES = [
 
 const fileFilter = (req, file, cb) => {
     if (ALLOWED_ATTACHMENT_MIME_TYPES.includes(file.mimetype)) cb(null, true);
-    else cb(new Error(`Formato de anexo não suportado: ${file.mimetype}`), false);
+    // AppError (não Error genérico): o handler global de erros (server.js) só devolve a mensagem
+    // ao cliente pra esse tipo — senão o rejeito de arquivo vazaria como stack trace.
+    else cb(new AppError(`Formato de anexo não suportado: ${file.mimetype}`), false);
 };
 
 const uploadAnexo = multer({

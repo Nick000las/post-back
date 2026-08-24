@@ -1,8 +1,8 @@
 const fs = require('fs');
 const path = require('path');
 const AppError = require('../errors/AppError.js');
+const { UPLOADS_DIR } = require('../config/uploadConfig.js');
 
-const UPLOADS_DIR = '.uploads';
 const GRAPH_API_BASE_URL = 'https://graph.facebook.com/v25.0';
 const POLLING_IMAGEM = { tentativas: 10, intervaloMs: 2000 };
 const POLLING_VIDEO = { tentativas: 30, intervaloMs: 5000 };
